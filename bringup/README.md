@@ -1,3 +1,8 @@
+> **Dashboard available:** run `elegoo-smartcar-control --robot-ip 192.168.0.213 --video udp --analogue-drive`.
+> For an offline preview use `elegoo-smartcar-control --dashboard-preview`.
+> See [dashboard usage](docs/dashboard/README.md) for Stop/Resume and display details.
+> The current tested firmware pair uses 38400 baud; earlier notes below describe bring-up history.
+
 # ELEGOO Smart Robot Car V4 bring-up
 
 Enter the project environment from this directory:

@@ -1,3 +1,8 @@
+> **Driving dashboard:** the analogue controller now opens the pygame dashboard.
+> Use `elegoo-smartcar-control --robot-ip YOUR_ROBOT_IP --video udp --analogue-drive`.
+> For an offline preview, use `elegoo-smartcar-control --dashboard-preview`.
+> See [dashboard usage](bringup/docs/dashboard/README.md).
+
 > **Local development checkpoint:** UDP video, analogue gamepad driving,
 > control-link recovery and servo fixes are documented in
 > [bring-up workspace notes](bringup/WORKSPACE.md). The dashboard mockup is in

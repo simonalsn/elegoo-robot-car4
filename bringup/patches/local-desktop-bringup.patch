@@ -1,3 +1,83 @@
+diff --git a/src/elegoo_robot_car4/analogue_drive.py b/src/elegoo_robot_car4/analogue_drive.py
+new file mode 100644
+index 0000000..3ca8153
+--- /dev/null
++++ b/src/elegoo_robot_car4/analogue_drive.py
+@@ -0,0 +1,74 @@
++"""Pure gamepad mixing and time-based smoothing; no hardware access."""
++from dataclasses import dataclass
++import math
++
++
++def deadzone(value: float, width: float) -> float:
++    value = max(-1.0, min(1.0, value))
++    return math.copysign(max(0.0, (abs(value)-width)/(1-width)), value)
++
++
++def expo(value: float) -> float:
++    """Cubic response, preserving sign and full-scale output."""
++    return value ** 3
++
++
++# Extra steering authority while driving; blend out completely for stationary pivots.
++MOVING_STEERING_FLOOR = 0.20
++STEERING_BLEND_THROTTLE = 0.25
++
++
++def mix_wheels(forward: float, reverse: float, steering: float):
++    """Return normalized L/R demand. Positive steering turns the nose right."""
++    if forward > 0.04 and reverse > 0.04:
++        return 0.0, 0.0
++    throttle = expo(deadzone(forward, 0.04)) - expo(deadzone(reverse, 0.04))
++    steer = expo(deadzone(steering, 0.08))
++    if steer != 0:
++        blend = min(1.0, abs(throttle)/STEERING_BLEND_THROTTLE)
++        floor = MOVING_STEERING_FLOOR * blend
++        steer = math.copysign(floor + (1-floor)*abs(steer), steer)
++    left, right = throttle + steer, throttle - steer
++    scale = max(1.0, abs(left), abs(right))
++    return left/scale, right/scale
++
++
++# User-tuned minimum moving-wheel output, applied after mixing.
++MIN_MOVING_PWM = 30
++MAX_PWM = 200
++
++
++def motor_pwm(demand: float) -> float:
++    """Map mixed wheel demand to PWM with a minimum for each moving wheel."""
++    if abs(demand) < 1e-12:  # ignore floating-point cancellation residue
++        return 0.0
++    return math.copysign(MIN_MOVING_PWM + (MAX_PWM-MIN_MOVING_PWM)*abs(demand), demand)
++
++
++@dataclass
++class AnalogueDrive:
++    left: float = 0.0
++    right: float = 0.0
++    head: float = 0.0
++    previous_time: float | None = None
++
++    def stop(self):
++        self.left = self.right = 0.0
++        self.previous_time = None
++
++    def update(self, forward, reverse, steering, camera, now):
++        dt = 1/30 if self.previous_time is None else max(0.0, min(0.1, now-self.previous_time))
++        self.previous_time = now
++        left, right = mix_wheels(forward, reverse, steering)
++        if left == right == 0:
++            self.left = self.right = 0.0  # stop is never ramped
++        else:
++            # Scale the change vector together, preserving its direction.
++            dl, dr = motor_pwm(left)-self.left, motor_pwm(right)-self.right
++            scale = min(1.0, 800*dt/max(abs(dl), abs(dr), 1e-9))
++            self.left += dl*scale
++            self.right += dr*scale
++        target = -80*deadzone(camera, 0.08)
++        delta = max(-450*dt, min(450*dt, target-self.head))
++        self.head += delta
++        return round(self.left), round(self.right), round(self.head)
 diff --git a/src/elegoo_robot_car4/car.py b/src/elegoo_robot_car4/car.py
 index ed641e9..c978496 100644
 --- a/src/elegoo_robot_car4/car.py
@@ -130,10 +210,10 @@ index ed641e9..c978496 100644
              self.__recv_msg_queue = self.__heartbeat_re.sub(
                  "", self.__recv_msg_queue
 diff --git a/src/elegoo_robot_car4/elegoo_smartcar_control.py b/src/elegoo_robot_car4/elegoo_smartcar_control.py
-index 3269509..f8849f9 100644
+index 3269509..6d9aaf1 100644
 --- a/src/elegoo_robot_car4/elegoo_smartcar_control.py
 +++ b/src/elegoo_robot_car4/elegoo_smartcar_control.py
-@@ -2,21 +2,27 @@
+@@ -2,21 +2,28 @@
  
  import argparse
  import functools as fun
@@ -154,6 +234,7 @@ index 3269509..f8849f9 100644
  from .person_follower import PersonFollower
 +from .udp_video import UdpVideo
 +from .analogue_drive import AnalogueDrive
++from .dashboard import Dashboard, DashboardState
  
  
  class GameEngine:
@@ -162,7 +243,7 @@ index 3269509..f8849f9 100644
      __head_delta: int = 10
      __min_speed: int = 50
      __max_speed: int = 200
-@@ -44,7 +50,7 @@ class GameEngine:
+@@ -44,7 +51,7 @@ class GameEngine:
      __person_follower: PersonFollower
      __run_person_follower: bool
  
@@ -171,7 +252,7 @@ index 3269509..f8849f9 100644
          """
          Constructor.
  
-@@ -56,15 +62,27 @@ class GameEngine:
+@@ -56,22 +63,45 @@ class GameEngine:
              dry_run:    Set this to True for debugging purpose (no socket call
                          will be actually made).
          """
@@ -182,7 +263,14 @@ index 3269509..f8849f9 100644
          self.__run_person_follower = False
          self.__car = Car(ip=robot_ip, log=log, dry_run=dry_run)
 +        self.__analogue = AnalogueDrive() if analogue_drive else None
-+        self.__neutral_required = False
++        self.__neutral_required = analogue_drive
++        self.__stop_held = False
++        self.__resume_requested = False
++        self.__ui = DashboardState() if analogue_drive else None
++        self.__dashboard = None
++        self.__last_raw_frame = None
++        self.__fps_sample = (time.monotonic(), 0)
++        self.__http_frames = 0
 +        self.__trace_camera = trace_camera
 +        if analogue_drive:
 +            try:
@@ -200,25 +288,55 @@ index 3269509..f8849f9 100644
          )
          # pygame requires frames in (width, height) format
          display_size = self.__dry_run_size if dry_run else capture_shape[::-1]
-@@ -82,14 +100,27 @@ class GameEngine:
+         self.__person_follower = PersonFollower(
+             car=self.__car, frame_shape_hw=capture_shape
+         )
+-        self.__display = pg.display.set_mode(display_size)
++        if analogue_drive:
++            self.__dashboard = Dashboard(robot_ip, 'preview' if dry_run else video, preview=dry_run)
++            self.__display = self.__dashboard.screen
++        else:
++            self.__display = pg.display.set_mode(display_size)
+         pg.display.set_caption("Elegoo Smart Robot Car v4.0 controller")
+ 
+         self.__delta_speed = self.__max_speed - self.__min_speed
+@@ -82,14 +112,45 @@ class GameEngine:
      def __exit__(self, exc_type, exc_val, exc_tb):
          self.release_resources()
  
 -    def __display_new_frame(self) -> None:
 +    def __display_new_frame(self) -> bool | None:
++        ui = getattr(self, "_GameEngine__ui", None)
++        dashboard = getattr(self, "_GameEngine__dashboard", None)
          if self.__dry_run:
              return
 -        frame = self.__car.capture()
 +        if self.__video is not None:
 +            frame, age = self.__video.latest()
++            if ui is not None:
++                ui.frame_age = age
++                self.__update_video_rate(self.__video.frames)
 +            if frame is None or age > 0.75:
 +                # Never drive using a frozen image. Keep the window responsive
 +                # while waiting for the subscription or recovering packet loss.
-+                self.__display.fill((25, 25, 25))
-+                pg.display.update()
++                if dashboard is None:
++                    self.__display.fill((25, 25, 25))
++                    pg.display.update()
++                else:
++                    ui.video_stale = True
 +                return False
 +        else:
 +            frame = self.__car.capture()
++            if ui is not None:
++                self.__http_frames += 1
++                self.__update_video_rate(self.__http_frames)
++                ui.frame_age = 0.0  # HTTP image has just been received, not capture latency.
++        if dashboard is not None:
++            ui.video_stale = False
++            if frame is not self.__last_raw_frame:
++                self.__last_raw_frame = frame
++                dashboard.set_frame(pg.surfarray.make_surface(self.__process_frame(frame)))
++            return True
          frame = self.__process_frame(frame)
 +        if self.__display.get_size() != frame.shape[:2]:
 +            self.__display = pg.display.set_mode(frame.shape[:2])
@@ -230,7 +348,7 @@ index 3269509..f8849f9 100644
  
      def __process_frame(self, frame: np.ndarray) -> np.ndarray:
          if self.__car.vision_tracking_is_on:
-@@ -114,17 +145,64 @@ class GameEngine:
+@@ -114,56 +175,117 @@ class GameEngine:
          Runs the game loop, translating player commands to the robot.
          """
  
@@ -244,77 +362,112 @@ index 3269509..f8849f9 100644
 +            clock.tick(30 if analogue else 10)
              events = pg.event.get()
 -            if any([e.type == pg.QUIT for e in events]):
+-                break
+-
+-            if self.__car.is_far_from_the_ground():
+-                self.__car.stop()
+-                continue
+-
+-            joystick_buttons = self.__detect_relevant_events(events)
+-
+-            keyboard_player_actions = self.__handle_keyboard_player_actions()
+-            if keyboard_player_actions["command_received"] == "finish":
 +            if any(e.type == pg.QUIT or (e.type == pg.KEYDOWN and e.key == pg.K_ESCAPE)
 +                   for e in events):
                  break
--
--            if self.__car.is_far_from_the_ground():
-+            self.__detect_relevant_events(events)
 +            try:
-+                if self.__display_new_frame() is False:
-+                    self.__car.stop()
++                self.__detect_relevant_events(events)
++                self.__handle_dashboard_events(events)
++                try:
++                    if self.__display_new_frame() is False:
++                        self.__car.stop()
++                        if analogue:
++                            analogue.stop()
++                            self.__neutral_required = True
++                        self.__dashboard_status('Driving blocked', 'Video is stale. Wait for fresh frames, then release driving controls.')
++                        pg.display.set_caption("UDP video unavailable/stale — driving blocked; Esc exits")
++                        continue
++                    if not analogue or time.monotonic() - ground_checked >= 0.1:
++                        raised = not self.__dry_run and self.__car.is_far_from_the_ground()
++                        ground_checked = time.monotonic()
++                except (OSError, ValueError, requests.RequestException, cv.error) as exc:
++                    with suppress(OSError):
++                        self.__car.stop()
 +                    if analogue:
 +                        analogue.stop()
-+                    pg.display.set_caption("UDP video unavailable/stale — driving blocked; Esc exits")
++                        self.__neutral_required = True
++                    self.__dashboard_status('Connection error', 'Stop requested. Waiting for a valid reply and neutral controls.', 'error')
++                    failures += 1
++                    pg.display.set_caption("Connection/camera error — stop requested")
++                    print(f"Connection/camera error; stop requested: {exc}", flush=True)
++                    if failures >= 3 and not analogue:
++                        raise RuntimeError("Repeated robot connection/camera failures") from exc
 +                    continue
-+                if not analogue or time.monotonic() - ground_checked >= 0.1:
-+                    raised = not self.__dry_run and self.__car.is_far_from_the_ground()
-+                    ground_checked = time.monotonic()
-+            except (OSError, ValueError, requests.RequestException, cv.error) as exc:
-+                with suppress(OSError):
-+                    self.__car.stop()
-+                if analogue:
-+                    analogue.stop()
-+                    self.__neutral_required = True
-+                failures += 1
-+                pg.display.set_caption("Connection/camera error — stop requested")
-+                print(f"Connection/camera error; stop requested: {exc}", flush=True)
-+                if failures >= 3 and not analogue:
-+                    raise RuntimeError("Repeated robot connection/camera failures") from exc
-+                continue
-+            failures = 0
-+            if raised:
-                 self.__car.stop()
-+                if analogue:
-+                    analogue.stop()
-+                pg.display.set_caption("Car raised: driving blocked — place on floor; Esc exits")
-+                continue
-+            pg.display.set_caption(
-+                "RT forward | LT reverse | both stop | left stick steer | right stick camera | Esc exits"
-+                if analogue else "Elegoo Smart Robot Car v4.0 controller — arrow keys drive")
++                failures = 0
++                if raised:
++                    if analogue:
++                        analogue.stop()
++                        self.__neutral_required = True
++                    try:
++                        self.__car.stop()
++                    except OSError:
++                        self.__dashboard_status('Stop unconfirmed', 'Car is raised; Stop reply failed. Driving remains blocked.', 'error')
++                    else:
++                        self.__dashboard_status('Driving blocked', 'Car is raised. Place it on the ground, then release driving controls.')
++                    pg.display.set_caption("Car raised: driving blocked — place on floor; Esc exits")
++                    continue
++                pg.display.set_caption(
++                    "RT forward | LT reverse | both stop | left stick steer | right stick camera | Esc exits"
++                    if analogue else "Elegoo Smart Robot Car v4.0 controller — arrow keys drive")
 +
-+            if analogue:
-+                # This mode sends one combined, leased drive/pan command. Do not
-+                # mix legacy keyboard/autonomous commands into that transaction.
-+                try:
-+                    self.__handle_analogue_actions()
-+                except (OSError, ValueError) as exc:
-+                    analogue.stop()
-+                    self.__neutral_required = True
-+                    pg.display.set_caption("Control reply failed — stopped; release triggers and steering")
-+                    print(f"Control reply failed; stop requested. Release triggers and steering. {exc}", flush=True)
-+                    # __handle_analogue_actions has already requested stop.
-+                    # Never replay the failed drive demand; recover with zero only.
-                 continue
--
--            joystick_buttons = self.__detect_relevant_events(events)
++                if analogue:
++                    # This mode sends one combined, leased drive/pan command. Do not
++                    # mix legacy keyboard/autonomous commands into that transaction.
++                    try:
++                        self.__handle_analogue_actions()
++                    except (OSError, ValueError) as exc:
++                        analogue.stop()
++                        self.__neutral_required = True
++                        self.__dashboard_status('Control reply failed', 'Stop requested. Release triggers and steering to recover.', 'error')
++                        pg.display.set_caption("Control reply failed — stopped; release triggers and steering")
++                        print(f"Control reply failed; stop requested. Release triggers and steering. {exc}", flush=True)
++                        # __handle_analogue_actions has already requested stop.
++                        # Never replay the failed drive demand; recover with zero only.
++                    continue
++
++                keyboard_player_actions = self.__handle_keyboard_player_actions()
++                if keyboard_player_actions["command_received"] == "finish":
++                    break
  
-             keyboard_player_actions = self.__handle_keyboard_player_actions()
-             if keyboard_player_actions["command_received"] == "finish":
-@@ -132,9 +210,7 @@ class GameEngine:
- 
-             move_command_received = keyboard_player_actions[
-                 "command_received"
+-            move_command_received = keyboard_player_actions[
+-                "command_received"
 -            ] == "movement" or self.__handle_controller_player_actions(
 -                joystick_buttons
 -            )
-+            ] == "movement" or self.__handle_controller_player_actions()
++                move_command_received = keyboard_player_actions[
++                    "command_received"
++                ] == "movement" or self.__handle_controller_player_actions()
  
-             if not self.__autonomous_mode:
-                 if not move_command_received:
-@@ -147,23 +223,25 @@ class GameEngine:
-             if self.__run_person_follower:
-                 self.__person_follower.follow(self.__last_track_results)
+-            if not self.__autonomous_mode:
+-                if not move_command_received:
+-                    self.__car.stop(lazy=True)
+-                self.__car.move()
++                if not self.__autonomous_mode:
++                    if not move_command_received:
++                        self.__car.stop(lazy=True)
++                    self.__car.move()
+ 
+-            if keyboard_player_actions["command_received"] == "terminal":
+-                self.__handle_terminal_input()
++                if keyboard_player_actions["command_received"] == "terminal":
++                    self.__handle_terminal_input()
+ 
+-            if self.__run_person_follower:
+-                self.__person_follower.follow(self.__last_track_results)
++                if self.__run_person_follower:
++                    self.__person_follower.follow(self.__last_track_results)
++            finally:
++                self.__render_dashboard()
  
 -    def __detect_relevant_events(self, events: list[pg.Event]) -> list[int]:
 -        joystick_buttons = []
@@ -353,7 +506,7 @@ index 3269509..f8849f9 100644
  
      def __handle_keyboard_player_actions(self) -> dict[str, int | str | None]:
          retval: dict[str, int | str | None] = {
-@@ -186,86 +264,103 @@ class GameEngine:
+@@ -186,86 +308,183 @@ class GameEngine:
                      break
          return retval
  
@@ -385,47 +538,7 @@ index 3269509..f8849f9 100644
 -                or reset_head_pos
 -                or (num_hats > 0 and (hat[0] != 0 or hat[1] != 0))
 -            )
-+    def __handle_analogue_actions(self):
-+        analogue = self.__analogue
-+        pad = next((p for p in self.__joysticks.values() if p.attached()), None)
-+        if pad is None or not pg.key.get_focused():
-+            self.__neutral_required = True
-+            analogue.stop()
-+            self.__car.stop()
-+            return
-+        def axis(name):
-+            return pad.get_axis(name) / 32768.0
-+        if getattr(self, "_GameEngine__neutral_required", False):
-+            analogue.stop()
-+            try:
-+                self.__car.drive_analogue(0, 0, round(analogue.head))
-+            except (OSError, ValueError):
-+                with suppress(OSError):
-+                    self.__car.stop()
-+                raise
-+            if (axis(pg.CONTROLLER_AXIS_TRIGGERRIGHT) <= 0.04
-+                    and axis(pg.CONTROLLER_AXIS_TRIGGERLEFT) <= 0.04
-+                    and abs(axis(pg.CONTROLLER_AXIS_LEFTX)) <= 0.08):
-+                self.__neutral_required = False
-+            else:
-+                pg.display.set_caption("Stopped after control error — release triggers and steering")
-+            return
-+        camera = 0 if pad.get_button(pg.CONTROLLER_BUTTON_X) else axis(pg.CONTROLLER_AXIS_RIGHTX)
-+        left, right, head = analogue.update(
-+            max(0, axis(pg.CONTROLLER_AXIS_TRIGGERRIGHT)),
-+            max(0, axis(pg.CONTROLLER_AXIS_TRIGGERLEFT)),
-+            axis(pg.CONTROLLER_AXIS_LEFTX),
-+            camera,
-+            time.monotonic())
-+        try:
-+            self.__car.drive_analogue(left, right, head)
-+            self.__trace_camera_command(camera, head)
-+        except Exception:
-+            analogue.stop()
-+            with suppress(OSError):
-+                self.__car.stop()
-+            raise
- 
+-
 -            if not move_command_received:
 -                return move_command_received
 -
@@ -477,6 +590,127 @@ index 3269509..f8849f9 100644
 -            command_received |= move_command_received
 -
 -        return command_received
++    def __handle_analogue_actions(self):
++        analogue = self.__analogue
++        pad = next((p for p in self.__joysticks.values() if p.attached()), None)
++        if pad is None or not pg.key.get_focused():
++            self.__neutral_required = True
++            analogue.stop()
++            self.__car.stop()
++            self.__dashboard_status('Driving blocked', 'Controller disconnected.' if pad is None else 'Window lost focus. Focus it and release driving controls.')
++            return
++        def axis(name):
++            return pad.get_axis(name) / 32768.0
++        ui = getattr(self, "_GameEngine__ui", None)
++        forward = max(0, axis(pg.CONTROLLER_AXIS_TRIGGERRIGHT))
++        reverse = max(0, axis(pg.CONTROLLER_AXIS_TRIGGERLEFT))
++        steering = axis(pg.CONTROLLER_AXIS_LEFTX)
++        neutral = forward <= .04 and reverse <= .04 and abs(steering) <= .08
++        if ui is not None:
++            ui.throttle = 0 if forward > .04 and reverse > .04 else forward-reverse
++            ui.steering = steering
++        if getattr(self, "_GameEngine__neutral_required", False) or getattr(self, "_GameEngine__stop_held", False):
++            analogue.stop()
++            try:
++                self.__send_analogue(0, 0, round(analogue.head))
++            except (OSError, ValueError):
++                with suppress(OSError):
++                    self.__car.stop()
++                raise
++            if getattr(self, "_GameEngine__stop_held", False):
++                self.__dashboard_status('Stopped by you', 'Release driving controls, then click Resume.', 'error')
++                if ui is not None:
++                    ui.can_resume = neutral
++                    ui.left = ui.right = 0
++                if neutral and getattr(self, "_GameEngine__resume_requested", False):
++                    self.__stop_held = False
++                    self.__neutral_required = False
++                    if ui is not None:
++                        ui.stopped = ui.can_resume = False
++                    self.__dashboard_status('Ready', 'Controls neutral. Use the triggers to drive.', 'good')
++            elif neutral:
++                self.__neutral_required = False
++                self.__dashboard_status('Ready', 'Controls neutral. Use the triggers to drive.', 'good')
++            else:
++                self.__dashboard_status('Release controls', 'Release both triggers and steering before driving can resume.')
++                pg.display.set_caption("Stopped after control error — release triggers and steering")
++            return
++        camera = 0 if pad.get_button(pg.CONTROLLER_BUTTON_X) else axis(pg.CONTROLLER_AXIS_RIGHTX)
++        left, right, head = analogue.update(
++            forward, reverse, steering,
++            camera,
++            time.monotonic())
++        try:
++            self.__send_analogue(left, right, head)
++            self.__dashboard_status('Driving' if left or right else 'Ready',
++                                    'Manual input active. You have control.' if left or right else
++                                    ('Both triggers pressed - wheels stopped.' if forward>.04 and reverse>.04 else 'Controls neutral. Use the triggers to drive.'), 'good')
++            self.__trace_camera_command(camera, head)
++        except Exception:
++            analogue.stop()
++            with suppress(OSError):
++                self.__car.stop()
++            raise
++
++    def __send_analogue(self, left, right, head):
++        started = time.perf_counter()
++        self.__car.drive_analogue(left, right, head)
++        ui = getattr(self, "_GameEngine__ui", None)
++        if ui is not None:
++            ui.left, ui.right, ui.head = left, right, head
++            if not self.__dry_run:
++                ui.ack_ms = (time.perf_counter()-started)*1000
++                ui.ack_at = time.monotonic()
++
++    def __dashboard_status(self, status, reason, level='warning'):
++        ui = getattr(self, "_GameEngine__ui", None)
++        if ui is not None:
++            ui.status, ui.reason, ui.level = status, reason, level
++            if level != 'good':
++                ui.left = ui.right = None
++                ui.can_resume = False
++
++    def __handle_dashboard_events(self, events):
++        dashboard = getattr(self, "_GameEngine__dashboard", None)
++        self.__resume_requested = False
++        if dashboard is None:
++            return
++        # Stop wins over Resume when both appear in the same event batch.
++        actions = [dashboard.action(event) for event in events]
++        if 'stop' in actions:
++            self.__stop_held = self.__neutral_required = True
++            self.__ui.stopped = True
++            self.__analogue.stop()
++            self.__dashboard_status('Stopped by you', 'Release driving controls, then click Resume.', 'error')
++            try:
++                self.__car.stop()
++            except OSError:
++                self.__dashboard_status('Stop unconfirmed', 'Control link did not confirm Stop. Driving remains blocked.', 'error')
++        elif 'resume' in actions and self.__stop_held and self.__ui.can_resume:
++            self.__resume_requested = True
++
++    def __update_video_rate(self, count):
++        now = time.monotonic()
++        previous, frames = self.__fps_sample
++        if now-previous >= 1:
++            self.__ui.fps = (count-frames)/(now-previous)
++            self.__fps_sample = (now, count)
++
++    def __render_dashboard(self):
++        dashboard = getattr(self, "_GameEngine__dashboard", None)
++        if dashboard is None:
++            return
++        ui = self.__ui
++        pad = next((p for p in self.__joysticks.values() if p.attached()), None)
++        ui.controller = pad.name if pad else 'No controller connected'
++        if pad is None:
++            ui.throttle = ui.steering = 0
++        ui.focused = bool(pg.key.get_focused())
++        if self.__video is not None:
++            _, ui.frame_age = self.__video.latest()
++            ui.video_stale = ui.frame_age > .75
++        dashboard.draw(ui, time.monotonic())
++
 +    def __trace_camera_command(self, stick, head):
 +        if not getattr(self, "_GameEngine__trace_camera", False):
 +            return
@@ -536,7 +770,7 @@ index 3269509..f8849f9 100644
  
      def __handle_terminal_input(self) -> None:
          print("Options:")
-@@ -318,7 +413,16 @@ class GameEngine:
+@@ -318,7 +537,16 @@ class GameEngine:
              self.__car.set_mode(user_choice)
  
      def release_resources(self):
@@ -554,7 +788,7 @@ index 3269509..f8849f9 100644
  
  
  def main() -> None:
-@@ -354,6 +458,12 @@ def main() -> None:
+@@ -354,12 +582,25 @@ def main() -> None:
          action="store_true",
          help="Print the version and exit.",
      )
@@ -564,10 +798,23 @@ index 3269509..f8849f9 100644
 +                        help="Trigger throttle + proportional steering/pan; requires new paired firmware.")
 +    parser.add_argument("--trace-camera", action="store_true",
 +                        help="Log acknowledged analogue camera targets on change and once per second.")
++    parser.add_argument("--dashboard-preview", action="store_true",
++                        help="Open the offline dashboard preview without connecting to a robot.")
      args = parser.parse_args()
  
      if args.version_requested:
-@@ -367,7 +477,7 @@ def main() -> None:
+         print(f"Version: {__version__}")
+         return
+ 
++    if args.dashboard_preview:
++        from .dashboard import preview
++        preview()
++        return
++
+     if not args.robot_ip:
+         print("Specify a robot IP address!")
+         exit(1)
+@@ -367,7 +608,7 @@ def main() -> None:
      pg.init()
  
      with GameEngine(
@@ -707,374 +954,6 @@ index 0000000..5154316
 +            pass  # firmware subscription also expires after three seconds
 +        finally:
 +            self._socket.close()
-diff --git a/src/elegoo_robot_car4/analogue_drive.py b/src/elegoo_robot_car4/analogue_drive.py
-new file mode 100644
-index 0000000..3ca8153
---- /dev/null
-+++ b/src/elegoo_robot_car4/analogue_drive.py
-@@ -0,0 +1,74 @@
-+"""Pure gamepad mixing and time-based smoothing; no hardware access."""
-+from dataclasses import dataclass
-+import math
-+
-+
-+def deadzone(value: float, width: float) -> float:
-+    value = max(-1.0, min(1.0, value))
-+    return math.copysign(max(0.0, (abs(value)-width)/(1-width)), value)
-+
-+
-+def expo(value: float) -> float:
-+    """Cubic response, preserving sign and full-scale output."""
-+    return value ** 3
-+
-+
-+# Extra steering authority while driving; blend out completely for stationary pivots.
-+MOVING_STEERING_FLOOR = 0.20
-+STEERING_BLEND_THROTTLE = 0.25
-+
-+
-+def mix_wheels(forward: float, reverse: float, steering: float):
-+    """Return normalized L/R demand. Positive steering turns the nose right."""
-+    if forward > 0.04 and reverse > 0.04:
-+        return 0.0, 0.0
-+    throttle = expo(deadzone(forward, 0.04)) - expo(deadzone(reverse, 0.04))
-+    steer = expo(deadzone(steering, 0.08))
-+    if steer != 0:
-+        blend = min(1.0, abs(throttle)/STEERING_BLEND_THROTTLE)
-+        floor = MOVING_STEERING_FLOOR * blend
-+        steer = math.copysign(floor + (1-floor)*abs(steer), steer)
-+    left, right = throttle + steer, throttle - steer
-+    scale = max(1.0, abs(left), abs(right))
-+    return left/scale, right/scale
-+
-+
-+# User-tuned minimum moving-wheel output, applied after mixing.
-+MIN_MOVING_PWM = 30
-+MAX_PWM = 200
-+
-+
-+def motor_pwm(demand: float) -> float:
-+    """Map mixed wheel demand to PWM with a minimum for each moving wheel."""
-+    if abs(demand) < 1e-12:  # ignore floating-point cancellation residue
-+        return 0.0
-+    return math.copysign(MIN_MOVING_PWM + (MAX_PWM-MIN_MOVING_PWM)*abs(demand), demand)
-+
-+
-+@dataclass
-+class AnalogueDrive:
-+    left: float = 0.0
-+    right: float = 0.0
-+    head: float = 0.0
-+    previous_time: float | None = None
-+
-+    def stop(self):
-+        self.left = self.right = 0.0
-+        self.previous_time = None
-+
-+    def update(self, forward, reverse, steering, camera, now):
-+        dt = 1/30 if self.previous_time is None else max(0.0, min(0.1, now-self.previous_time))
-+        self.previous_time = now
-+        left, right = mix_wheels(forward, reverse, steering)
-+        if left == right == 0:
-+            self.left = self.right = 0.0  # stop is never ramped
-+        else:
-+            # Scale the change vector together, preserving its direction.
-+            dl, dr = motor_pwm(left)-self.left, motor_pwm(right)-self.right
-+            scale = min(1.0, 800*dt/max(abs(dl), abs(dr), 1e-9))
-+            self.left += dl*scale
-+            self.right += dr*scale
-+        target = -80*deadzone(camera, 0.08)
-+        delta = max(-450*dt, min(450*dt, target-self.head))
-+        self.head += delta
-+        return round(self.left), round(self.right), round(self.head)
-diff --git a/tests/unit_tests/test_bringup_regressions.py b/tests/unit_tests/test_bringup_regressions.py
-new file mode 100644
-index 0000000..79bf990
---- /dev/null
-+++ b/tests/unit_tests/test_bringup_regressions.py
-@@ -0,0 +1,85 @@
-+from unittest.mock import MagicMock
-+
-+import pygame as pg
-+import pytest
-+
-+from elegoo_robot_car4 import Car
-+from elegoo_robot_car4.elegoo_smartcar_control import GameEngine
-+
-+
-+def test_closed_control_socket_fails_instead_of_spinning(car_mocks):
-+    car_mocks["socket"].recv.return_value = b""
-+    with Car() as car, pytest.raises(ConnectionError, match="closed"):
-+        car.is_far_from_the_ground()
-+
-+
-+def test_heartbeats_do_not_extend_command_deadline(car_mocks, mocker):
-+    car_mocks["socket"].recv.return_value = b"{Heartbeat}"
-+    with Car() as car:
-+        clock = iter([0.0, 0.0, 0.0, 0.5, 1.0, 2.1])
-+        mocker.patch("elegoo_robot_car4.car.time.monotonic", side_effect=clock)
-+        with pytest.raises(TimeoutError, match="timed out"):
-+            car.is_far_from_the_ground()
-+    assert car_mocks["socket"].recv.call_count == 2
-+
-+
-+def test_truncated_jpeg_is_rejected(car_mocks):
-+    response = car_mocks["capture_request"].return_value
-+    response._content = b"\xff\xd8truncated"
-+    with Car() as car, pytest.raises(ValueError, match="Incomplete"):
-+        car.capture()
-+
-+
-+def engine_for_loop(mocker):
-+    engine = GameEngine.__new__(GameEngine)
-+    engine._GameEngine__car = MagicMock()
-+    engine._GameEngine__dry_run = False
-+    engine._GameEngine__car.is_far_from_the_ground.return_value = True
-+    mocker.patch.object(engine, "_GameEngine__display_new_frame")
-+    mocker.patch("pygame.time.Clock")
-+    caption = mocker.patch("pygame.display.set_caption")
-+    return engine, caption
-+
-+
-+def test_escape_works_while_ground_guard_blocks_driving(mocker):
-+    engine, caption = engine_for_loop(mocker)
-+    mocker.patch("pygame.event.get", side_effect=[[], [pg.event.Event(pg.KEYDOWN, key=pg.K_ESCAPE)]])
-+    engine.run()
-+    engine._GameEngine__car.stop.assert_called_once()
-+    engine._GameEngine__car.move.assert_not_called()
-+    assert "Car raised" in caption.call_args.args[0]
-+
-+
-+def test_bad_camera_frame_stops_then_recovers_without_driving(mocker):
-+    engine, caption = engine_for_loop(mocker)
-+    engine._GameEngine__display_new_frame.side_effect = [ValueError("Incomplete camera JPEG"), None]
-+    mocker.patch("pygame.event.get", side_effect=[[], [], [pg.event.Event(pg.QUIT)]])
-+    engine.run()
-+    assert engine._GameEngine__car.stop.call_count == 2
-+    engine._GameEngine__car.move.assert_not_called()
-+    assert "Car raised" in caption.call_args.args[0]
-+
-+
-+def test_cleanup_requests_stop_even_after_loop_error(mocker):
-+    engine, _ = engine_for_loop(mocker)
-+    engine._GameEngine__car.stop.side_effect = OSError("disconnected")
-+    engine.release_resources()
-+    engine._GameEngine__car.disconnect.assert_called_once()
-+
-+
-+def test_stale_udp_video_blocks_driving_but_quit_still_works(mocker):
-+    engine, caption = engine_for_loop(mocker)
-+    engine._GameEngine__display_new_frame.return_value = False
-+    mocker.patch("pygame.event.get", side_effect=[[], [pg.event.Event(pg.QUIT)]])
-+    engine.run()
-+    engine._GameEngine__car.stop.assert_called_once()
-+    engine._GameEngine__car.move.assert_not_called()
-+    engine._GameEngine__car.is_far_from_the_ground.assert_not_called()
-+    assert "stale" in caption.call_args.args[0]
-+
-+
-+def test_cleanup_unsubscribes_udp_video(mocker):
-+    engine, _ = engine_for_loop(mocker)
-+    engine._GameEngine__video = MagicMock()
-+    engine.release_resources()
-+    engine._GameEngine__video.close.assert_called_once()
-diff --git a/tests/unit_tests/test_udp_video.py b/tests/unit_tests/test_udp_video.py
-new file mode 100644
-index 0000000..99e22b7
---- /dev/null
-+++ b/tests/unit_tests/test_udp_video.py
-@@ -0,0 +1,92 @@
-+import struct
-+import socket
-+import time
-+
-+import cv2 as cv
-+import numpy as np
-+
-+from elegoo_robot_car4.udp_video import CHUNK, HEADER, FrameAssembler, UdpVideo
-+
-+
-+def packets(data, seq=1, token=123):
-+    count = (len(data) + CHUNK - 1) // CHUNK
-+    return [HEADER.pack(b'EVF1', token, seq, len(data), i, count)
-+            + data[i*CHUNK:(i+1)*CHUNK] for i in range(count)]
-+
-+
-+def test_reordered_fragments_and_duplicates():
-+    data = b'\xff\xd8' + b'x' * 3500 + b'\xff\xd9'
-+    p = packets(data)
-+    a = FrameAssembler(123)
-+    assert a.feed(p[2], 0) is None
-+    assert a.feed(p[2], 0.01) is None
-+    assert a.feed(p[0], 0.02) is None
-+    assert a.feed(p[1], 0.03) == data
-+    assert a.feed(p[0], 0.04) is None
-+
-+
-+def test_lost_frame_does_not_hold_up_next_frame_or_accept_old_packets():
-+    data = b'\xff\xd8' + b'x' * 1300 + b'\xff\xd9'
-+    a = FrameAssembler(123)
-+    old, new = packets(data), packets(data, 2)
-+    assert a.feed(old[0], 0) is None
-+    assert a.feed(new[1], 0.1) is None
-+    assert a.feed(old[1], 0.11) is None
-+    assert a.feed(new[0], 0.12) == data
-+
-+
-+def test_expired_incomplete_frame_is_never_published():
-+    data = b'\xff\xd8' + b'x' * 1300 + b'\xff\xd9'
-+    a = FrameAssembler(123)
-+    p = packets(data)
-+    assert a.feed(p[0], 0) is None
-+    assert a.feed(p[1], 0.3) is None
-+    assert a.feed(p[0], 0.31) is None
-+
-+
-+def test_invalid_lengths_tokens_and_jpeg_rejected():
-+    a = FrameAssembler(123)
-+    for p in [b'', packets(b'\xff\xd8ok\xff\xd9', token=9)[0],
-+              HEADER.pack(b'EVF1', 123, 1, 999999, 0, 834),
-+              packets(b'notajpeg')[0], packets(b'\xff\xd8ok\xff\xd9')[0][:-1]]:
-+        assert a.feed(p, 0) is None
-+
-+
-+def test_sequence_wrap():
-+    a = FrameAssembler(123)
-+    data = b'\xff\xd8ok\xff\xd9'
-+    assert a.feed(packets(data, 0xffffffff)[0], 0) == data
-+    assert a.feed(packets(data, 0)[0], 0.1) == data
-+    assert a.feed(packets(data, 0xffffffff)[0], 0.2) is None
-+
-+
-+def test_real_udp_subscription_decode_and_unsubscribe():
-+    server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-+    server.bind(('127.0.0.1', 0))
-+    server.settimeout(2)
-+    receiver = UdpVideo('127.0.0.1', server.getsockname()[1])
-+    try:
-+        request, peer = server.recvfrom(32)
-+        magic, token = struct.unpack('!4sI', request)
-+        assert magic == b'EVS1'
-+        ok, jpeg = cv.imencode('.jpg', np.zeros((60, 80, 3), np.uint8))
-+        assert ok
-+        for packet in reversed(packets(jpeg.tobytes(), token=token)):
-+            server.sendto(packet, peer)
-+        deadline = time.monotonic() + 2
-+        frame, age = receiver.latest()
-+        while frame is None and time.monotonic() < deadline:
-+            time.sleep(0.01)
-+            frame, age = receiver.latest()
-+        assert frame.shape == (60, 80, 3)
-+        assert age < 0.5
-+    finally:
-+        receiver.close()
-+    try:
-+        while True:
-+            request, _ = server.recvfrom(32)
-+            if request[:4] == b'EVX1':
-+                assert request[4:] == struct.pack('!I', token)
-+                break
-+    finally:
-+        server.close()
-diff --git a/tests/unit_tests/test_gamepad.py b/tests/unit_tests/test_gamepad.py
-new file mode 100644
-index 0000000..b1fcca0
---- /dev/null
-+++ b/tests/unit_tests/test_gamepad.py
-@@ -0,0 +1,93 @@
-+from unittest.mock import MagicMock
-+import pygame as pg
-+import pytest
-+from elegoo_robot_car4.elegoo_smartcar_control import GameEngine
-+
-+
-+def pad(axes=None, buttons=()):
-+    result = MagicMock()
-+    result.attached.return_value = True
-+    result.get_axis.side_effect = lambda axis: (axes or {}).get(axis, 0)
-+    result.get_button.side_effect = lambda button: button in buttons
-+    return result
-+
-+
-+def engine(*pads):
-+    result = GameEngine.__new__(GameEngine)
-+    result._GameEngine__car = MagicMock()
-+    result._GameEngine__joysticks = dict(enumerate(pads))
-+    result._GameEngine__delta_speed = 150
-+    return result
-+
-+
-+@pytest.mark.parametrize('x,y,action', [
-+    (0,-32768,'forward'), (0,32767,'backward'),
-+    (-32768,0,'left'), (32767,0,'right'),
-+    (-32768,-32768,'forward_left'), (32767,-32768,'forward_right'),
-+    (-32768,32767,'backward_left'), (32767,32767,'backward_right')])
-+def test_stick_directions(x,y,action):
-+    e=engine(pad({pg.CONTROLLER_AXIS_LEFTX:x,pg.CONTROLLER_AXIS_LEFTY:y}))
-+    assert e._GameEngine__handle_controller_player_actions()
-+    getattr(e._GameEngine__car,action).assert_called_once_with(speed=50,lazy=True)
-+
-+
-+def test_neutral_and_deadzone_return_no_drive():
-+    e=engine(pad({pg.CONTROLLER_AXIS_LEFTX:4000,pg.CONTROLLER_AXIS_LEFTY:-1000}))
-+    assert not e._GameEngine__handle_controller_player_actions()
-+    assert not e._GameEngine__car.mock_calls
-+
-+
-+def test_trigger_and_stick_scale_speed():
-+    p=pad({pg.CONTROLLER_AXIS_LEFTY:-32768,pg.CONTROLLER_AXIS_TRIGGERRIGHT:32767})
-+    e=engine(p)
-+    e._GameEngine__handle_controller_player_actions()
-+    e._GameEngine__car.forward.assert_called_once_with(speed=200,lazy=True)
-+    e=engine(pad({pg.CONTROLLER_AXIS_LEFTY:-19661,pg.CONTROLLER_AXIS_TRIGGERRIGHT:32767}))
-+    e._GameEngine__handle_controller_player_actions()
-+    e._GameEngine__car.forward.assert_called_once_with(speed=125,lazy=True)
-+
-+
-+def test_idle_pad_does_not_hide_active_pad():
-+    e=engine(pad(),pad(buttons=[pg.CONTROLLER_BUTTON_DPAD_UP]))
-+    assert e._GameEngine__handle_controller_player_actions()
-+    e._GameEngine__car.forward.assert_called_once_with(speed=50,lazy=True)
-+
-+
-+def test_pan_stops_previous_drive_before_queuing_head_command():
-+    e=engine(pad({pg.CONTROLLER_AXIS_RIGHTX:32767,pg.CONTROLLER_AXIS_LEFTY:-32768}))
-+    assert e._GameEngine__handle_controller_player_actions()
-+    assert [c[0] for c in e._GameEngine__car.mock_calls] == ['stop','turn_head']
-+    e._GameEngine__car.turn_head.assert_called_once_with(-10,lazy=True)
-+
-+
-+def test_x_centres_camera():
-+    e=engine(pad(buttons=[pg.CONTROLLER_BUTTON_X]))
-+    e._GameEngine__handle_controller_player_actions()
-+    e._GameEngine__car.stop.assert_called_once()
-+    e._GameEngine__car.set_head_angle.assert_called_once_with(lazy=True)
-+
-+
-+def test_hotplug_processed_while_raised(mocker):
-+    e=engine()
-+    p=pad()
-+    p.as_joystick.return_value.get_instance_id.return_value=42
-+    mocker.patch('elegoo_robot_car4.elegoo_smartcar_control.gamecontroller.is_controller',return_value=True)
-+    mocker.patch('elegoo_robot_car4.elegoo_smartcar_control.gamecontroller.Controller',return_value=p)
-+    e._GameEngine__dry_run=False
-+    e._GameEngine__car.is_far_from_the_ground.return_value=True
-+    mocker.patch.object(e,'_GameEngine__display_new_frame')
-+    mocker.patch('pygame.time.Clock')
-+    mocker.patch('pygame.display.set_caption')
-+    mocker.patch('pygame.event.get',side_effect=[
-+        [pg.event.Event(pg.JOYDEVICEADDED,device_index=0)], [pg.event.Event(pg.QUIT)]])
-+    e.run()
-+    assert e._GameEngine__joysticks[42] is p
-+    e._GameEngine__car.move.assert_not_called()
-+
-+
-+def test_disconnect_and_unknown_disconnect_are_safe():
-+    p=pad();e=engine(p)
-+    e._GameEngine__detect_relevant_events([pg.event.Event(pg.JOYDEVICEREMOVED,instance_id=0),
-+                                        pg.event.Event(pg.JOYDEVICEREMOVED,instance_id=999)])
-+    assert not e._GameEngine__handle_controller_player_actions()
-+    p.quit.assert_called_once()
 diff --git a/tests/unit_tests/test_analogue_drive.py b/tests/unit_tests/test_analogue_drive.py
 new file mode 100644
 index 0000000..fa46928
@@ -1406,3 +1285,752 @@ index 0000000..fa46928
 +    left,right,_=drive.update(1,0,.081,0,1/30)
 +    assert left==200 and right==173
 +    assert drive.update(1,1,1,0,2/30)[:2]==(0,0)
+diff --git a/tests/unit_tests/test_bringup_regressions.py b/tests/unit_tests/test_bringup_regressions.py
+new file mode 100644
+index 0000000..79bf990
+--- /dev/null
++++ b/tests/unit_tests/test_bringup_regressions.py
+@@ -0,0 +1,85 @@
++from unittest.mock import MagicMock
++
++import pygame as pg
++import pytest
++
++from elegoo_robot_car4 import Car
++from elegoo_robot_car4.elegoo_smartcar_control import GameEngine
++
++
++def test_closed_control_socket_fails_instead_of_spinning(car_mocks):
++    car_mocks["socket"].recv.return_value = b""
++    with Car() as car, pytest.raises(ConnectionError, match="closed"):
++        car.is_far_from_the_ground()
++
++
++def test_heartbeats_do_not_extend_command_deadline(car_mocks, mocker):
++    car_mocks["socket"].recv.return_value = b"{Heartbeat}"
++    with Car() as car:
++        clock = iter([0.0, 0.0, 0.0, 0.5, 1.0, 2.1])
++        mocker.patch("elegoo_robot_car4.car.time.monotonic", side_effect=clock)
++        with pytest.raises(TimeoutError, match="timed out"):
++            car.is_far_from_the_ground()
++    assert car_mocks["socket"].recv.call_count == 2
++
++
++def test_truncated_jpeg_is_rejected(car_mocks):
++    response = car_mocks["capture_request"].return_value
++    response._content = b"\xff\xd8truncated"
++    with Car() as car, pytest.raises(ValueError, match="Incomplete"):
++        car.capture()
++
++
++def engine_for_loop(mocker):
++    engine = GameEngine.__new__(GameEngine)
++    engine._GameEngine__car = MagicMock()
++    engine._GameEngine__dry_run = False
++    engine._GameEngine__car.is_far_from_the_ground.return_value = True
++    mocker.patch.object(engine, "_GameEngine__display_new_frame")
++    mocker.patch("pygame.time.Clock")
++    caption = mocker.patch("pygame.display.set_caption")
++    return engine, caption
++
++
++def test_escape_works_while_ground_guard_blocks_driving(mocker):
++    engine, caption = engine_for_loop(mocker)
++    mocker.patch("pygame.event.get", side_effect=[[], [pg.event.Event(pg.KEYDOWN, key=pg.K_ESCAPE)]])
++    engine.run()
++    engine._GameEngine__car.stop.assert_called_once()
++    engine._GameEngine__car.move.assert_not_called()
++    assert "Car raised" in caption.call_args.args[0]
++
++
++def test_bad_camera_frame_stops_then_recovers_without_driving(mocker):
++    engine, caption = engine_for_loop(mocker)
++    engine._GameEngine__display_new_frame.side_effect = [ValueError("Incomplete camera JPEG"), None]
++    mocker.patch("pygame.event.get", side_effect=[[], [], [pg.event.Event(pg.QUIT)]])
++    engine.run()
++    assert engine._GameEngine__car.stop.call_count == 2
++    engine._GameEngine__car.move.assert_not_called()
++    assert "Car raised" in caption.call_args.args[0]
++
++
++def test_cleanup_requests_stop_even_after_loop_error(mocker):
++    engine, _ = engine_for_loop(mocker)
++    engine._GameEngine__car.stop.side_effect = OSError("disconnected")
++    engine.release_resources()
++    engine._GameEngine__car.disconnect.assert_called_once()
++
++
++def test_stale_udp_video_blocks_driving_but_quit_still_works(mocker):
++    engine, caption = engine_for_loop(mocker)
++    engine._GameEngine__display_new_frame.return_value = False
++    mocker.patch("pygame.event.get", side_effect=[[], [pg.event.Event(pg.QUIT)]])
++    engine.run()
++    engine._GameEngine__car.stop.assert_called_once()
++    engine._GameEngine__car.move.assert_not_called()
++    engine._GameEngine__car.is_far_from_the_ground.assert_not_called()
++    assert "stale" in caption.call_args.args[0]
++
++
++def test_cleanup_unsubscribes_udp_video(mocker):
++    engine, _ = engine_for_loop(mocker)
++    engine._GameEngine__video = MagicMock()
++    engine.release_resources()
++    engine._GameEngine__video.close.assert_called_once()
+diff --git a/tests/unit_tests/test_gamepad.py b/tests/unit_tests/test_gamepad.py
+new file mode 100644
+index 0000000..b1fcca0
+--- /dev/null
++++ b/tests/unit_tests/test_gamepad.py
+@@ -0,0 +1,93 @@
++from unittest.mock import MagicMock
++import pygame as pg
++import pytest
++from elegoo_robot_car4.elegoo_smartcar_control import GameEngine
++
++
++def pad(axes=None, buttons=()):
++    result = MagicMock()
++    result.attached.return_value = True
++    result.get_axis.side_effect = lambda axis: (axes or {}).get(axis, 0)
++    result.get_button.side_effect = lambda button: button in buttons
++    return result
++
++
++def engine(*pads):
++    result = GameEngine.__new__(GameEngine)
++    result._GameEngine__car = MagicMock()
++    result._GameEngine__joysticks = dict(enumerate(pads))
++    result._GameEngine__delta_speed = 150
++    return result
++
++
++@pytest.mark.parametrize('x,y,action', [
++    (0,-32768,'forward'), (0,32767,'backward'),
++    (-32768,0,'left'), (32767,0,'right'),
++    (-32768,-32768,'forward_left'), (32767,-32768,'forward_right'),
++    (-32768,32767,'backward_left'), (32767,32767,'backward_right')])
++def test_stick_directions(x,y,action):
++    e=engine(pad({pg.CONTROLLER_AXIS_LEFTX:x,pg.CONTROLLER_AXIS_LEFTY:y}))
++    assert e._GameEngine__handle_controller_player_actions()
++    getattr(e._GameEngine__car,action).assert_called_once_with(speed=50,lazy=True)
++
++
++def test_neutral_and_deadzone_return_no_drive():
++    e=engine(pad({pg.CONTROLLER_AXIS_LEFTX:4000,pg.CONTROLLER_AXIS_LEFTY:-1000}))
++    assert not e._GameEngine__handle_controller_player_actions()
++    assert not e._GameEngine__car.mock_calls
++
++
++def test_trigger_and_stick_scale_speed():
++    p=pad({pg.CONTROLLER_AXIS_LEFTY:-32768,pg.CONTROLLER_AXIS_TRIGGERRIGHT:32767})
++    e=engine(p)
++    e._GameEngine__handle_controller_player_actions()
++    e._GameEngine__car.forward.assert_called_once_with(speed=200,lazy=True)
++    e=engine(pad({pg.CONTROLLER_AXIS_LEFTY:-19661,pg.CONTROLLER_AXIS_TRIGGERRIGHT:32767}))
++    e._GameEngine__handle_controller_player_actions()
++    e._GameEngine__car.forward.assert_called_once_with(speed=125,lazy=True)
++
++
++def test_idle_pad_does_not_hide_active_pad():
++    e=engine(pad(),pad(buttons=[pg.CONTROLLER_BUTTON_DPAD_UP]))
++    assert e._GameEngine__handle_controller_player_actions()
++    e._GameEngine__car.forward.assert_called_once_with(speed=50,lazy=True)
++
++
++def test_pan_stops_previous_drive_before_queuing_head_command():
++    e=engine(pad({pg.CONTROLLER_AXIS_RIGHTX:32767,pg.CONTROLLER_AXIS_LEFTY:-32768}))
++    assert e._GameEngine__handle_controller_player_actions()
++    assert [c[0] for c in e._GameEngine__car.mock_calls] == ['stop','turn_head']
++    e._GameEngine__car.turn_head.assert_called_once_with(-10,lazy=True)
++
++
++def test_x_centres_camera():
++    e=engine(pad(buttons=[pg.CONTROLLER_BUTTON_X]))
++    e._GameEngine__handle_controller_player_actions()
++    e._GameEngine__car.stop.assert_called_once()
++    e._GameEngine__car.set_head_angle.assert_called_once_with(lazy=True)
++
++
++def test_hotplug_processed_while_raised(mocker):
++    e=engine()
++    p=pad()
++    p.as_joystick.return_value.get_instance_id.return_value=42
++    mocker.patch('elegoo_robot_car4.elegoo_smartcar_control.gamecontroller.is_controller',return_value=True)
++    mocker.patch('elegoo_robot_car4.elegoo_smartcar_control.gamecontroller.Controller',return_value=p)
++    e._GameEngine__dry_run=False
++    e._GameEngine__car.is_far_from_the_ground.return_value=True
++    mocker.patch.object(e,'_GameEngine__display_new_frame')
++    mocker.patch('pygame.time.Clock')
++    mocker.patch('pygame.display.set_caption')
++    mocker.patch('pygame.event.get',side_effect=[
++        [pg.event.Event(pg.JOYDEVICEADDED,device_index=0)], [pg.event.Event(pg.QUIT)]])
++    e.run()
++    assert e._GameEngine__joysticks[42] is p
++    e._GameEngine__car.move.assert_not_called()
++
++
++def test_disconnect_and_unknown_disconnect_are_safe():
++    p=pad();e=engine(p)
++    e._GameEngine__detect_relevant_events([pg.event.Event(pg.JOYDEVICEREMOVED,instance_id=0),
++                                        pg.event.Event(pg.JOYDEVICEREMOVED,instance_id=999)])
++    assert not e._GameEngine__handle_controller_player_actions()
++    p.quit.assert_called_once()
+diff --git a/tests/unit_tests/test_udp_video.py b/tests/unit_tests/test_udp_video.py
+new file mode 100644
+index 0000000..99e22b7
+--- /dev/null
++++ b/tests/unit_tests/test_udp_video.py
+@@ -0,0 +1,92 @@
++import struct
++import socket
++import time
++
++import cv2 as cv
++import numpy as np
++
++from elegoo_robot_car4.udp_video import CHUNK, HEADER, FrameAssembler, UdpVideo
++
++
++def packets(data, seq=1, token=123):
++    count = (len(data) + CHUNK - 1) // CHUNK
++    return [HEADER.pack(b'EVF1', token, seq, len(data), i, count)
++            + data[i*CHUNK:(i+1)*CHUNK] for i in range(count)]
++
++
++def test_reordered_fragments_and_duplicates():
++    data = b'\xff\xd8' + b'x' * 3500 + b'\xff\xd9'
++    p = packets(data)
++    a = FrameAssembler(123)
++    assert a.feed(p[2], 0) is None
++    assert a.feed(p[2], 0.01) is None
++    assert a.feed(p[0], 0.02) is None
++    assert a.feed(p[1], 0.03) == data
++    assert a.feed(p[0], 0.04) is None
++
++
++def test_lost_frame_does_not_hold_up_next_frame_or_accept_old_packets():
++    data = b'\xff\xd8' + b'x' * 1300 + b'\xff\xd9'
++    a = FrameAssembler(123)
++    old, new = packets(data), packets(data, 2)
++    assert a.feed(old[0], 0) is None
++    assert a.feed(new[1], 0.1) is None
++    assert a.feed(old[1], 0.11) is None
++    assert a.feed(new[0], 0.12) == data
++
++
++def test_expired_incomplete_frame_is_never_published():
++    data = b'\xff\xd8' + b'x' * 1300 + b'\xff\xd9'
++    a = FrameAssembler(123)
++    p = packets(data)
++    assert a.feed(p[0], 0) is None
++    assert a.feed(p[1], 0.3) is None
++    assert a.feed(p[0], 0.31) is None
++
++
++def test_invalid_lengths_tokens_and_jpeg_rejected():
++    a = FrameAssembler(123)
++    for p in [b'', packets(b'\xff\xd8ok\xff\xd9', token=9)[0],
++              HEADER.pack(b'EVF1', 123, 1, 999999, 0, 834),
++              packets(b'notajpeg')[0], packets(b'\xff\xd8ok\xff\xd9')[0][:-1]]:
++        assert a.feed(p, 0) is None
++
++
++def test_sequence_wrap():
++    a = FrameAssembler(123)
++    data = b'\xff\xd8ok\xff\xd9'
++    assert a.feed(packets(data, 0xffffffff)[0], 0) == data
++    assert a.feed(packets(data, 0)[0], 0.1) == data
++    assert a.feed(packets(data, 0xffffffff)[0], 0.2) is None
++
++
++def test_real_udp_subscription_decode_and_unsubscribe():
++    server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
++    server.bind(('127.0.0.1', 0))
++    server.settimeout(2)
++    receiver = UdpVideo('127.0.0.1', server.getsockname()[1])
++    try:
++        request, peer = server.recvfrom(32)
++        magic, token = struct.unpack('!4sI', request)
++        assert magic == b'EVS1'
++        ok, jpeg = cv.imencode('.jpg', np.zeros((60, 80, 3), np.uint8))
++        assert ok
++        for packet in reversed(packets(jpeg.tobytes(), token=token)):
++            server.sendto(packet, peer)
++        deadline = time.monotonic() + 2
++        frame, age = receiver.latest()
++        while frame is None and time.monotonic() < deadline:
++            time.sleep(0.01)
++            frame, age = receiver.latest()
++        assert frame.shape == (60, 80, 3)
++        assert age < 0.5
++    finally:
++        receiver.close()
++    try:
++        while True:
++            request, _ = server.recvfrom(32)
++            if request[:4] == b'EVX1':
++                assert request[4:] == struct.pack('!I', token)
++                break
++    finally:
++        server.close()
+diff --git a/src/elegoo_robot_car4/dashboard.py b/src/elegoo_robot_car4/dashboard.py
+new file mode 100644
+index 0000000..c10c85c
+--- /dev/null
++++ b/src/elegoo_robot_car4/dashboard.py
+@@ -0,0 +1,247 @@
++"""Pygame driving dashboard. Rendering has no robot or gamepad side effects."""
++from dataclasses import dataclass
++import math
++import pygame as pg
++
++
++@dataclass
++class DashboardState:
++    status: str = 'Waiting'
++    reason: str = 'Waiting for video and controller.'
++    level: str = 'warning'
++    controller: str = 'No controller connected'
++    focused: bool = False
++    throttle: float = 0.0
++    steering: float = 0.0
++    head: int = 0
++    left: int | None = None
++    right: int | None = None
++    ack_ms: float | None = None
++    ack_at: float | None = None
++    fps: float | None = None
++    frame_age: float = float('inf')
++    video_stale: bool = True
++    stopped: bool = False
++    can_resume: bool = False
++
++
++class Dashboard:
++    SIZE = (1280, 960)
++    BG = '#101619'
++    PANEL = '#1a2328'
++    EDGE = '#303c43'
++    TEXT = '#eff5f6'
++    MUTED = '#a5b4bc'
++    GREEN = '#7be1bf'
++    AMBER = '#f8c876'
++    RED = '#ff9399'
++    STOP = pg.Rect(930, 237, 304, 46)
++    RESUME = pg.Rect(930, 291, 304, 32)
++
++    def __init__(self, robot_ip='', transport='udp', preview=False):
++        pg.font.init()
++        self.screen = pg.display.set_mode((1200, 900), pg.RESIZABLE)
++        self.canvas = pg.Surface(self.SIZE)
++        self.fonts = {size: pg.font.SysFont('sans', size) for size in (14, 16, 18, 22, 28, 32)}
++        self.robot_ip, self.transport, self.preview = robot_ip, transport, preview
++        self.frame = None
++        self.frame_size = None
++        self._scaled_frame = None
++        self.offset = (0, 0)
++        self.scale = 1.0
++        self._transform()
++
++    def _transform(self):
++        w, h = self.screen.get_size()
++        self.scale = min(w/self.SIZE[0], h/self.SIZE[1])
++        self.offset = ((w-round(self.SIZE[0]*self.scale))//2,
++                       (h-round(self.SIZE[1]*self.scale))//2)
++
++    def action(self, event):
++        if event.type == pg.VIDEORESIZE:
++            self.screen = pg.display.set_mode((max(640, event.w), max(480, event.h)), pg.RESIZABLE)
++            self._transform()
++        if event.type == pg.KEYDOWN and event.key == pg.K_SPACE:
++            return 'stop'
++        if event.type == pg.MOUSEBUTTONDOWN and event.button == 1:
++            self._transform()
++            point = tuple((p-o)/self.scale for p, o in zip(event.pos, self.offset))
++            if self.STOP.collidepoint(point):
++                return 'stop'
++            if self.RESUME.collidepoint(point):
++                return 'resume'
++        return None
++
++    def set_frame(self, surface):
++        self.frame = surface
++        self.frame_size = surface.get_size()
++        box = pg.Rect(24, 140, 864, 648)
++        rect = surface.get_rect().fit(box)
++        self._scaled_frame = (pg.transform.smoothscale(surface, rect.size), rect)
++
++    def text(self, text, x, y, size=18, color=None):
++        self.canvas.blit(self.fonts[size].render(str(text), True, color or self.TEXT), (x, y))
++
++    def wrapped(self, text, x, y, width, size=16, color=None):
++        words, line = text.split(), ''
++        for word in words:
++            candidate = (line+' '+word).strip()
++            if line and self.fonts[size].size(candidate)[0] > width:
++                self.text(line, x, y, size, color)
++                y += size+5
++                line = word
++            else:
++                line = candidate
++        if line:
++            self.text(line, x, y, size, color)
++        return y+size+5
++
++    def panel(self, rect):
++        pg.draw.rect(self.canvas, self.PANEL, rect, border_radius=10)
++        pg.draw.rect(self.canvas, self.EDGE, rect, 1, border_radius=10)
++
++    def meter(self, y, label, value, description):
++        self.text(label, 930, y, 18)
++        font = self.fonts[16]
++        self.text(description, 1234-font.size(description)[0], y+2, 16, self.GREEN)
++        pg.draw.rect(self.canvas, '#36434a', (930, y+31, 304, 7), border_radius=3)
++        value = max(-1, min(1, value))
++        length = round(abs(value)*152)
++        pg.draw.rect(self.canvas, self.GREEN, (1082-length if value<0 else 1082, y+31, length, 7), border_radius=3)
++        pg.draw.line(self.canvas, self.TEXT, (1082, y+27), (1082, y+42))
++
++    def draw(self, state, now):
++        self.canvas.fill(self.BG)
++        self.text('Car dashboard', 24, 19, 32)
++        self.text('ELEGOO V4  /  Manual control', 25, 57, 16, self.MUTED)
++        connected = state.ack_at is not None and now-state.ack_at < 2
++        label = 'OFFLINE PREVIEW - no robot connection' if self.preview else (
++            ('Control responding' if connected else 'Control awaiting reply')+'  /  '+self.robot_ip)
++        self.text(label, 750, 45, 16, self.AMBER if self.preview or not connected else self.GREEN)
++        self.panel(pg.Rect(24, 98, 864, 750))
++        self.text('Camera', 42, 108, 22)
++        resolution = 'Waiting for frames' if self.frame_size is None else f'{self.frame_size[0]} x {self.frame_size[1]}'
++        self.text(f'{resolution}  /  {self.transport.upper()}', 612, 112, 16, self.MUTED)
++        pg.draw.rect(self.canvas, '#11191d', (24, 140, 864, 648))
++        if self._scaled_frame:
++            self.canvas.blit(*self._scaled_frame)
++            if not state.video_stale:
++                pg.draw.line(self.canvas, '#ffffff', (446, 464), (466, 464))
++                pg.draw.line(self.canvas, '#ffffff', (456, 454), (456, 474))
++        if state.video_stale:
++            overlay = pg.Surface((864, 648), pg.SRCALPHA)
++            overlay.fill((12, 20, 26, 185))
++            self.canvas.blit(overlay, (24, 140))
++            self.text('Waiting for fresh video', 298, 433, 28)
++            self.text('Driving is blocked while the image is stale.', 276, 479, 18, self.MUTED)
++        else:
++            pg.draw.rect(self.canvas, '#17232b', (42, 744, 300, 30), border_radius=5)
++            self.text(f'Camera target: {self.pan_label(state.head)}', 53, 749, 16)
++        age = '--' if not math.isfinite(state.frame_age) else f'{state.frame_age*1000:.0f} ms'
++        ack = '--' if state.ack_ms is None else f'{state.ack_ms:.0f} ms'
++        if state.ack_at is not None and now-state.ack_at >= 2:
++            ack += ' (old)'
++        metrics = [('VIDEO RATE', '--' if state.fps is None else f'{state.fps:.1f} fps'),
++                   ('RECEIVE AGE', age), ('LAST CONTROL REPLY', ack)]
++        for x, (title, value) in zip((42, 325, 608), metrics):
++            self.text(title, x, 798, 14, self.MUTED)
++            self.text(value, x, 819, 18)
++        self.panel(pg.Rect(908, 98, 348, 237))
++        color = {'good': self.GREEN, 'warning': self.AMBER, 'error': self.RED}.get(state.level, self.AMBER)
++        pg.draw.line(self.canvas, color, (920, 99), (1244, 99), 3)
++        self.text('DRIVE STATUS', 930, 113, 14, self.MUTED)
++        self.text(state.status, 930, 139, 28, color)
++        self.wrapped(state.reason, 930, 180, 302, 16)
++        pg.draw.rect(self.canvas, '#eaa3a7', self.STOP, border_radius=6)
++        self.text('Stop driving', 945, 246, 22, '#2a141a')
++        self.text('SPACE', 1174, 250, 14, '#2a141a')
++        if state.stopped:
++            pg.draw.rect(self.canvas, '#29453d' if state.can_resume else '#29333a', self.RESUME, border_radius=5)
++            self.text('Resume' if state.can_resume else 'Resume - waiting for neutral / ready', 940, 296, 16,
++                      self.GREEN if state.can_resume else self.MUTED)
++        self.panel(pg.Rect(908, 351, 348, 320))
++        self.text('Commanded inputs', 930, 365, 22)
++        self.text('Inputs / targets, not measured speed', 930, 395, 14, self.MUTED)
++        throttle = 'Neutral' if abs(state.throttle)<.04 else f'{"Forward" if state.throttle>0 else "Reverse"} {abs(state.throttle)*100:.0f}%'
++        steering = 'Centred' if abs(state.steering)<=.08 else f'{"Right" if state.steering>0 else "Left"} {abs(state.steering)*100:.0f}%'
++        self.meter(426, 'Throttle', state.throttle, throttle)
++        self.meter(479, 'Steering', state.steering, steering)
++        self.meter(532, 'Camera target', -state.head/80, self.pan_label(state.head))
++        for x, label, pwm in ((930, 'LEFT WHEELS', state.left), (1090, 'RIGHT WHEELS', state.right)):
++            pg.draw.rect(self.canvas, '#121b20', (x, 592, 144, 64), border_radius=5)
++            self.text(label, x+10, 599, 14, self.MUTED)
++            self.text('--' if pwm is None else f'{pwm} PWM', x+10, 620, 22)
++        self.panel(pg.Rect(908, 687, 348, 161))
++        self.text('Controller', 930, 702, 22)
++        self.wrapped(state.controller, 930, 739, 300, 16, self.MUTED)
++        self.text('Window focused' if state.focused else 'Window unfocused - driving blocked', 930, 798, 16,
++                  self.GREEN if state.focused else self.AMBER)
++        self.panel(pg.Rect(24, 866, 1232, 68))
++        guides = [('RT / LT', 'Forward / reverse', 'Both triggers stop'),
++                  ('LEFT STICK', 'Steer / stationary pivot', 'Mix steering with throttle'),
++                  ('RIGHT STICK', 'Aim camera', 'Release or X to centre'),
++                  ('SPACE / STOP', 'Stop and hold', 'Neutral, then click Resume')]
++        for x, (key, title, detail) in zip((42, 350, 658, 966), guides):
++            self.text(key, x, 872, 14, self.GREEN)
++            self.text(title, x, 891, 16)
++            self.text(detail, x, 913, 14, self.MUTED)
++        self.text('Manual mode / ground and fresh-video checks enabled', 24, 940, 14, self.MUTED)
++        self.text('Esc: exit', 1170, 940, 14, self.MUTED)
++        self._transform()
++        size = (round(self.SIZE[0]*self.scale), round(self.SIZE[1]*self.scale))
++        self.screen.fill(self.BG)
++        self.screen.blit(pg.transform.smoothscale(self.canvas, size), self.offset)
++        pg.display.flip()
++
++    @staticmethod
++    def pan_label(head):
++        return 'centred' if head == 0 else f'{abs(head)} deg {"right" if head<0 else "left"}'
++
++
++def preview():
++    """Offline preview, deliberately without constructing Car or UdpVideo."""
++    import time
++    pg.init()
++    dashboard = Dashboard(preview=True)
++    pg.display.set_caption('Car dashboard - OFFLINE preview (1 Ready, 2 Driving, 3 Video lost)')
++    scene = pg.Surface((800, 600))
++    scene.fill('#809093')
++    pg.draw.polygon(scene, '#6b7069', [(0, 335), (460, 290), (800, 320), (800, 600), (0, 600)])
++    pg.draw.rect(scene, '#37494e', (485, 75, 115, 220))
++    for x in range(-700, 1600, 300):
++        pg.draw.line(scene, '#889089', (460, 290), (x, 600))
++    scene.blit(pg.font.SysFont('sans', 20).render('Illustrated placeholder - no live video', True, 'white'), (20, 20))
++    dashboard.set_frame(scene)
++    state = DashboardState(status='Ready', reason='Offline preview. Press 1, 2 or 3 to change state.', level='good',
++                           controller='8BitDo Ultimate 2C (simulated)', focused=True, left=0, right=0,
++                           frame_age=.042, fps=12, ack_ms=18, video_stale=False)
++    clock = pg.time.Clock()
++    running = True
++    try:
++        while running:
++            for e in pg.event.get():
++                if e.type == pg.QUIT or (e.type == pg.KEYDOWN and e.key == pg.K_ESCAPE):
++                    running = False
++                action = dashboard.action(e)
++                if action == 'stop':
++                    state.status, state.reason, state.level = 'Stopped by you', 'Offline stop preview. Click Resume to reset.', 'error'
++                    state.stopped = state.can_resume = True
++                    state.left = state.right = 0
++                elif action == 'resume' and state.can_resume:
++                    state = DashboardState(status='Ready', reason='Offline preview - no robot connected.', level='good', focused=True,
++                                           controller='Simulated controller', frame_age=.042, fps=12, video_stale=False, left=0, right=0)
++                if e.type == pg.KEYDOWN and e.key in (pg.K_1, pg.K_2, pg.K_3):
++                    state.stopped = state.can_resume = False
++                    state.status = {pg.K_1:'Ready', pg.K_2:'Driving', pg.K_3:'Driving blocked'}[e.key]
++                    state.reason = 'Offline preview - simulated data only.'
++                    state.video_stale = e.key == pg.K_3
++                    state.level = 'warning' if state.video_stale else 'good'
++                    state.throttle, state.steering = ((.65, .24) if e.key==pg.K_2 else (0,0))
++                    state.left, state.right = ((108,39) if e.key==pg.K_2 else (0,0))
++                    state.frame_age = 1.2 if state.video_stale else .042
++                    state.fps = 0 if state.video_stale else 12
++            state.ack_at = time.monotonic()
++            dashboard.draw(state, time.monotonic())
++            clock.tick(30)
++    finally:
++        pg.quit()
+diff --git a/tests/unit_tests/test_dashboard.py b/tests/unit_tests/test_dashboard.py
+new file mode 100644
+index 0000000..fcf1e2b
+--- /dev/null
++++ b/tests/unit_tests/test_dashboard.py
+@@ -0,0 +1,202 @@
++"""Dashboard input and interlock checks; all robot calls are mocked."""
++from unittest.mock import MagicMock
++import pygame as pg
++import pytest
++from elegoo_robot_car4.dashboard import Dashboard, DashboardState
++from elegoo_robot_car4.elegoo_smartcar_control import GameEngine
++from elegoo_robot_car4.analogue_drive import AnalogueDrive
++
++
++def engine(mocker, axes=None):
++    axes = {} if axes is None else axes
++    e = GameEngine.__new__(GameEngine)
++    e._GameEngine__car = MagicMock()
++    e._GameEngine__analogue = AnalogueDrive()
++    e._GameEngine__ui = DashboardState()
++    e._GameEngine__dashboard = MagicMock()
++    e._GameEngine__dashboard.action.side_effect = lambda event: event
++    e._GameEngine__dry_run = False
++    e._GameEngine__stop_held = False
++    e._GameEngine__neutral_required = False
++    pad = MagicMock()
++    pad.attached.return_value = True
++    pad.get_button.return_value = False
++    pad.get_axis.side_effect = lambda axis: axes.get(axis, 0)
++    e._GameEngine__joysticks = {1: pad}
++    mocker.patch('pygame.key.get_focused', return_value=True)
++    return e
++
++
++def test_stop_latches_until_explicit_resume_and_current_neutral(mocker):
++    axes = {pg.CONTROLLER_AXIS_TRIGGERRIGHT: 32767}
++    e = engine(mocker, axes)
++    e._GameEngine__handle_dashboard_events(['stop'])
++    e._GameEngine__handle_analogue_actions()
++    assert e._GameEngine__stop_held
++    assert not e._GameEngine__ui.can_resume
++    e._GameEngine__car.drive_analogue.assert_called_with(0, 0, 0)
++    axes.clear()
++    e._GameEngine__handle_analogue_actions()
++    assert e._GameEngine__ui.can_resume and e._GameEngine__stop_held
++    e._GameEngine__handle_dashboard_events(['resume'])
++    # Pressing a trigger after the last UI render invalidates the resume attempt.
++    axes[pg.CONTROLLER_AXIS_TRIGGERRIGHT] = 32767
++    e._GameEngine__handle_analogue_actions()
++    assert e._GameEngine__stop_held
++    e._GameEngine__handle_dashboard_events([])
++    axes.clear()
++    e._GameEngine__handle_analogue_actions()
++    assert e._GameEngine__stop_held
++    e._GameEngine__handle_dashboard_events(['resume'])
++    e._GameEngine__handle_analogue_actions()
++    assert not e._GameEngine__stop_held
++    assert e._GameEngine__ui.status == 'Ready'
++    assert all(call.args[:2] == (0, 0) for call in e._GameEngine__car.drive_analogue.call_args_list)
++
++
++def test_stop_wins_over_resume_and_survives_failed_stop_ack(mocker):
++    e = engine(mocker)
++    e._GameEngine__ui.can_resume = True
++    e._GameEngine__car.stop.side_effect = TimeoutError()
++    e._GameEngine__handle_dashboard_events(['resume', 'stop'])
++    assert e._GameEngine__stop_held and e._GameEngine__neutral_required
++    assert not e._GameEngine__resume_requested
++    assert e._GameEngine__ui.status == 'Stop unconfirmed'
++
++
++def test_resume_requires_successful_zero_ack(mocker):
++    e = engine(mocker)
++    e._GameEngine__handle_dashboard_events(['stop'])
++    e._GameEngine__ui.can_resume = True
++    e._GameEngine__handle_dashboard_events(['resume'])
++    e._GameEngine__car.drive_analogue.side_effect = TimeoutError()
++    with pytest.raises(TimeoutError):
++        e._GameEngine__handle_analogue_actions()
++    assert e._GameEngine__stop_held
++    assert e._GameEngine__ui.ack_at is None
++
++
++@pytest.mark.parametrize('guard', ['stale', 'raised'])
++def test_environment_guard_recovery_requires_neutral(mocker, guard):
++    axes = {pg.CONTROLLER_AXIS_TRIGGERRIGHT: 32767}
++    e = engine(mocker, axes)
++    e._GameEngine__car.is_far_from_the_ground.side_effect = [guard=='raised', False]
++    mocker.patch.object(e, '_GameEngine__render_dashboard')
++    mocker.patch.object(e, '_GameEngine__display_new_frame', side_effect=[guard!='stale', True])
++    mocker.patch('pygame.time.Clock')
++    mocker.patch('pygame.display.set_caption')
++    mocker.patch('pygame.event.get', side_effect=[[], [], [pg.event.Event(pg.QUIT)]])
++    # Force sensor refresh on both iterations without depending on wall time.
++    mocker.patch('elegoo_robot_car4.elegoo_smartcar_control.time.monotonic', side_effect=lambda: 10+e._GameEngine__car.is_far_from_the_ground.call_count)
++    e.run()
++    assert e._GameEngine__neutral_required
++    for call in e._GameEngine__car.drive_analogue.call_args_list:
++        assert call.args[:2] == (0, 0)
++
++
++def test_command_indicators_update_only_after_ack(mocker):
++    e = engine(mocker)
++    e._GameEngine__send_analogue(120, 60, -25)
++    state = e._GameEngine__ui
++    assert (state.left, state.right, state.head) == (120, 60, -25)
++    assert state.ack_ms >= 0 and state.ack_at is not None
++    e._GameEngine__car.drive_analogue.side_effect = TimeoutError()
++    with pytest.raises(TimeoutError):
++        e._GameEngine__send_analogue(200, 200, 0)
++    assert (state.left, state.right, state.head) == (120, 60, -25)
++    e._GameEngine__dashboard_status('Error', 'Unknown output', 'error')
++    assert state.left is None and state.right is None
++
++
++@pytest.fixture
++def dashboard(monkeypatch):
++    monkeypatch.setenv('SDL_VIDEODRIVER', 'dummy')
++    monkeypatch.setenv('SDL_AUDIODRIVER', 'dummy')
++    pg.init()
++    d = Dashboard(preview=True)
++    yield d
++    pg.quit()
++
++
++@pytest.mark.parametrize('size', [(1280, 960), (900, 700), (1600, 900)])
++def test_stop_and_resume_hitboxes_follow_letterboxed_resize(dashboard, size):
++    dashboard.action(pg.event.Event(pg.VIDEORESIZE, w=size[0], h=size[1]))
++    for rect, expected in [(Dashboard.STOP, 'stop'), (Dashboard.RESUME, 'resume')]:
++        point = tuple(round(p*dashboard.scale+o) for p,o in zip(rect.center, dashboard.offset))
++        assert dashboard.action(pg.event.Event(pg.MOUSEBUTTONDOWN, button=1, pos=point)) == expected
++    assert dashboard.action(pg.event.Event(pg.KEYDOWN, key=pg.K_SPACE)) == 'stop'
++    assert dashboard.action(pg.event.Event(pg.MOUSEBUTTONDOWN, button=1, pos=(0,0))) is None
++
++
++def test_camera_keeps_aspect_ratio_and_states_render_without_robot(dashboard):
++    frame = pg.Surface((800, 600))
++    frame.fill('blue')
++    dashboard.set_frame(frame)
++    rect = dashboard._scaled_frame[1]
++    assert rect.w/rect.h == pytest.approx(4/3)
++    for state in [DashboardState(), DashboardState(status='Ready', video_stale=False),
++                  DashboardState(status='Stopped by you', stopped=True, can_resume=True),
++                  DashboardState(status='Connection error', reason='No valid reply; driving blocked.', level='error')]:
++        dashboard.draw(state, 1)
++    assert Dashboard.pan_label(-35) == '35 deg right'
++
++
++def test_actual_dashboard_loop_uses_cached_udp_frame_and_stop_resume(dashboard, mocker):
++    import numpy as np
++    car = mocker.patch('elegoo_robot_car4.elegoo_smartcar_control.Car').return_value
++    car.vision_tracking_is_on = False
++    car.is_far_from_the_ground.return_value = False
++    video = mocker.patch('elegoo_robot_car4.elegoo_smartcar_control.UdpVideo').return_value
++    video.latest.return_value = (np.zeros((600, 800, 3), dtype=np.uint8), .02)
++    video.frames = 1
++    mocker.patch('elegoo_robot_car4.elegoo_smartcar_control.PersonFollower')
++    mocker.patch('pygame.key.get_focused', return_value=True)
++    mocker.patch('pygame.time.Clock')
++    with GameEngine('test.invalid', video='udp', analogue_drive=True) as e:
++        pad = MagicMock()
++        pad.name = 'Test controller'
++        pad.attached.return_value = True
++        pad.get_axis.return_value = 0
++        pad.get_button.return_value = False
++        e._GameEngine__joysticks = {1: pad}
++        view = e._GameEngine__dashboard
++        render_frame = mocker.spy(view, 'set_frame')
++        point = tuple(round(p*view.scale+o) for p,o in zip(view.RESUME.center, view.offset))
++        mocker.patch('pygame.event.get', side_effect=[[], [pg.event.Event(pg.KEYDOWN, key=pg.K_SPACE)],
++                    [], [pg.event.Event(pg.MOUSEBUTTONDOWN, button=1, pos=point)], [], [pg.event.Event(pg.QUIT)]])
++        e.run()
++        assert e._GameEngine__ui.status == 'Ready'
++        assert not e._GameEngine__stop_held
++        render_frame.assert_called_once()  # repeated polls do not rescale old video
++        assert view.frame_size == (800, 600)
++        assert all(call.args[:2] == (0, 0) for call in car.drive_analogue.call_args_list)
++        car.capture.assert_not_called()
++    video.close.assert_called_once()
++    car.disconnect.assert_called_once()
++
++
++def test_preview_cli_does_not_construct_robot(mocker):
++    from elegoo_robot_car4.elegoo_smartcar_control import main
++    mocker.patch('sys.argv', ['elegoo-smartcar-control', '--dashboard-preview'])
++    preview = mocker.patch('elegoo_robot_car4.dashboard.preview')
++    car = mocker.patch('elegoo_robot_car4.elegoo_smartcar_control.Car')
++    video = mocker.patch('elegoo_robot_car4.elegoo_smartcar_control.UdpVideo')
++    main()
++    preview.assert_called_once()
++    car.assert_not_called()
++    video.assert_not_called()
++
++
++def test_raised_stop_timeout_keeps_dashboard_alive_and_drive_blocked(mocker):
++    e = engine(mocker)
++    e._GameEngine__car.is_far_from_the_ground.return_value = True
++    e._GameEngine__car.stop.side_effect = TimeoutError()
++    mocker.patch.object(e, '_GameEngine__render_dashboard')
++    mocker.patch.object(e, '_GameEngine__display_new_frame', return_value=True)
++    mocker.patch('pygame.time.Clock')
++    mocker.patch('pygame.display.set_caption')
++    mocker.patch('pygame.event.get', side_effect=[[], [pg.event.Event(pg.QUIT)]])
++    e.run()
++    assert e._GameEngine__ui.status == 'Stop unconfirmed'
++    assert e._GameEngine__neutral_required
++    e._GameEngine__car.drive_analogue.assert_not_called()

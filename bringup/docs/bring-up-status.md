@@ -331,3 +331,12 @@ throttle preserves the existing pivot curve. At full throttle initial turning
 targets about 200/143 PWM. No firmware change. Physical tuning pending.
 All 40 analogue control tests pass, including forward/reverse boost, blend
 continuity, wheel limits, acceleration limiting and immediate stop.
+
+## Implemented driving dashboard
+
+The analogue pygame client now uses the reviewed dashboard layout. Status,
+commanded inputs/outputs, camera target, video metrics, controller/focus state,
+Stop/Space latch and explicit neutral-before-resume are implemented. Offline
+preview is available with `--dashboard-preview`. Rendering and control interlocks
+are tested with mocked hardware; no robot commands or physical driving test were
+performed for this change. See `docs/dashboard/README.md` for usage and limitations.
