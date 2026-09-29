@@ -2,21 +2,27 @@
 
 import argparse
 import functools as fun
+import time
+from contextlib import suppress
 from collections.abc import Callable
 from typing import Any
 
 import cv2 as cv
 import numpy as np
 import pygame as pg
+from pygame._sdl2 import controller as gamecontroller
+import requests
 from ultralytics.engine.results import Results
 
 from .__init__ import __version__
 from .car import Car
 from .person_follower import PersonFollower
+from .udp_video import UdpVideo
+from .analogue_drive import AnalogueDrive
 
 
 class GameEngine:
-    __joysticks: dict[int, pg.joystick.JoystickType]
+    __joysticks: dict[int, gamecontroller.Controller]
     __head_delta: int = 10
     __min_speed: int = 50
     __max_speed: int = 200
@@ -44,7 +50,7 @@ class GameEngine:
     __person_follower: PersonFollower
     __run_person_follower: bool
 
-    def __init__(self, robot_ip: str, log: bool = False, dry_run: bool = False):
+    def __init__(self, robot_ip: str, log: bool = False, dry_run: bool = False, video: str = "http", analogue_drive: bool = False, trace_camera: bool = False):
         """
         Constructor.
 
@@ -56,15 +62,27 @@ class GameEngine:
             dry_run:    Set this to True for debugging purpose (no socket call
                         will be actually made).
         """
+        gamecontroller.init()
         self.__joysticks = {}
         self.__dry_run = dry_run
         self.__autonomous_mode = False
         self.__run_person_follower = False
         self.__car = Car(ip=robot_ip, log=log, dry_run=dry_run)
+        self.__analogue = AnalogueDrive() if analogue_drive else None
+        self.__neutral_required = False
+        self.__trace_camera = trace_camera
+        if analogue_drive:
+            try:
+                self.__car.enable_analogue_drive()
+            except Exception:
+                self.__car.disconnect()
+                raise
         self.__last_track_results = []
+        self.__video = UdpVideo(robot_ip) if video == "udp" and not dry_run else None
+        # UDP starts asynchronously; no HTTP capture before the window opens.
         # capture shape (height, width), OpenCV format
         capture_shape = np.array(
-            self.__dry_run_size if dry_run else self.__car.capture().shape[:2]
+            self.__dry_run_size if dry_run else ((600, 800) if self.__video else self.__car.capture().shape[:2])
         )
         # pygame requires frames in (width, height) format
         display_size = self.__dry_run_size if dry_run else capture_shape[::-1]
@@ -82,14 +100,27 @@ class GameEngine:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.release_resources()
 
-    def __display_new_frame(self) -> None:
+    def __display_new_frame(self) -> bool | None:
         if self.__dry_run:
             return
-        frame = self.__car.capture()
+        if self.__video is not None:
+            frame, age = self.__video.latest()
+            if frame is None or age > 0.75:
+                # Never drive using a frozen image. Keep the window responsive
+                # while waiting for the subscription or recovering packet loss.
+                self.__display.fill((25, 25, 25))
+                pg.display.update()
+                return False
+        else:
+            frame = self.__car.capture()
         frame = self.__process_frame(frame)
+        if self.__display.get_size() != frame.shape[:2]:
+            self.__display = pg.display.set_mode(frame.shape[:2])
+            self.__person_follower = PersonFollower(self.__car, np.array(frame.shape[:2][::-1]))
         # blit it to the display surface.  simple!
         pg.surfarray.blit_array(self.__display, frame)
         pg.display.update()
+        return True
 
     def __process_frame(self, frame: np.ndarray) -> np.ndarray:
         if self.__car.vision_tracking_is_on:
@@ -114,17 +145,64 @@ class GameEngine:
         Runs the game loop, translating player commands to the robot.
         """
 
+        clock = pg.time.Clock()
+        failures = 0
+        ground_checked = 0.0
+        raised = True
         while True:
-            self.__display_new_frame()
+            analogue = getattr(self, "_GameEngine__analogue", None)
+            clock.tick(30 if analogue else 10)
             events = pg.event.get()
-            if any([e.type == pg.QUIT for e in events]):
+            if any(e.type == pg.QUIT or (e.type == pg.KEYDOWN and e.key == pg.K_ESCAPE)
+                   for e in events):
                 break
-
-            if self.__car.is_far_from_the_ground():
-                self.__car.stop()
+            self.__detect_relevant_events(events)
+            try:
+                if self.__display_new_frame() is False:
+                    self.__car.stop()
+                    if analogue:
+                        analogue.stop()
+                    pg.display.set_caption("UDP video unavailable/stale — driving blocked; Esc exits")
+                    continue
+                if not analogue or time.monotonic() - ground_checked >= 0.1:
+                    raised = not self.__dry_run and self.__car.is_far_from_the_ground()
+                    ground_checked = time.monotonic()
+            except (OSError, ValueError, requests.RequestException, cv.error) as exc:
+                with suppress(OSError):
+                    self.__car.stop()
+                if analogue:
+                    analogue.stop()
+                    self.__neutral_required = True
+                failures += 1
+                pg.display.set_caption("Connection/camera error — stop requested")
+                print(f"Connection/camera error; stop requested: {exc}", flush=True)
+                if failures >= 3 and not analogue:
+                    raise RuntimeError("Repeated robot connection/camera failures") from exc
                 continue
+            failures = 0
+            if raised:
+                self.__car.stop()
+                if analogue:
+                    analogue.stop()
+                pg.display.set_caption("Car raised: driving blocked — place on floor; Esc exits")
+                continue
+            pg.display.set_caption(
+                "RT forward | LT reverse | both stop | left stick steer | right stick camera | Esc exits"
+                if analogue else "Elegoo Smart Robot Car v4.0 controller — arrow keys drive")
 
-            joystick_buttons = self.__detect_relevant_events(events)
+            if analogue:
+                # This mode sends one combined, leased drive/pan command. Do not
+                # mix legacy keyboard/autonomous commands into that transaction.
+                try:
+                    self.__handle_analogue_actions()
+                except (OSError, ValueError) as exc:
+                    analogue.stop()
+                    self.__neutral_required = True
+                    pg.display.set_caption("Control reply failed — stopped; release triggers and steering")
+                    print(f"Control reply failed; stop requested. Release triggers and steering. {exc}", flush=True)
+                    # __handle_analogue_actions has already requested stop.
+                    # Never replay the failed drive demand; recover with zero only.
+                continue
 
             keyboard_player_actions = self.__handle_keyboard_player_actions()
             if keyboard_player_actions["command_received"] == "finish":
@@ -132,9 +210,7 @@ class GameEngine:
 
             move_command_received = keyboard_player_actions[
                 "command_received"
-            ] == "movement" or self.__handle_controller_player_actions(
-                joystick_buttons
-            )
+            ] == "movement" or self.__handle_controller_player_actions()
 
             if not self.__autonomous_mode:
                 if not move_command_received:
@@ -147,23 +223,25 @@ class GameEngine:
             if self.__run_person_follower:
                 self.__person_follower.follow(self.__last_track_results)
 
-    def __detect_relevant_events(self, events: list[pg.Event]) -> list[int]:
-        joystick_buttons = []
+    def __detect_relevant_events(self, events: list[pg.Event]) -> None:
+        # Process hotplug even while raised or waiting for video. Otherwise the
+        # initial connection event is consumed and the pad is never registered.
         for e in events:
-            # Handle hotplugging
             if e.type == pg.JOYDEVICEADDED:
-                # This event will be generated for every joystick when the
-                # program starts, filling up the list without needing to
-                # create them manually.
-                joy = pg.joystick.Joystick(e.device_index)
-                self.__joysticks[joy.get_instance_id()] = joy
-
-            if e.type == pg.JOYDEVICEREMOVED:
-                del self.__joysticks[e.instance_id]
-
-            if e.type == pg.JOYBUTTONDOWN:
-                joystick_buttons += [e.button]
-        return joystick_buttons
+                if not gamecontroller.is_controller(e.device_index):
+                    print("Gamepad has no SDL mapping; ignoring it instead of guessing axes.")
+                    continue
+                pad = gamecontroller.Controller(e.device_index)
+                ident = pad.as_joystick().get_instance_id()
+                self.__joysticks[ident] = pad
+                controls = ("RT forward; LT reverse; both stop; left stick steers; right stick aims camera."
+                            if getattr(self, "_GameEngine__analogue", None) else
+                            "Left stick/D-pad drive; RT adds speed; right stick pans; X centres camera.")
+                print(f"Gamepad connected: {pad.name}. {controls}", flush=True)
+            elif e.type == pg.JOYDEVICEREMOVED:
+                pad = self.__joysticks.pop(e.instance_id, None)
+                if pad is not None:
+                    pad.quit()
 
     def __handle_keyboard_player_actions(self) -> dict[str, int | str | None]:
         retval: dict[str, int | str | None] = {
@@ -186,86 +264,103 @@ class GameEngine:
                     break
         return retval
 
-    def __handle_controller_player_actions(self, buttons: list[int]) -> bool:
-        command_received = False
-        for stick in self.__joysticks.values():
-            lr_axis = stick.get_axis(0)
-            fb_axis = stick.get_axis(1)
-            head_axis = stick.get_axis(3)
-            num_hats = stick.get_numhats()
-            hat = stick.get_hat(0) if num_hats > 0 else None
-            # Use right trigger for tuning speed
-            speed_axis = 0.5 * (
-                stick.get_axis(5) + 1.0
-            )  # Now this is a number in [0,1]
-            cur_speed = round(
-                np.clip(
-                    self.__min_speed + speed_axis * self.__delta_speed,
-                    a_min=0,
-                    a_max=255,
-                )
-            )
+    def __handle_analogue_actions(self):
+        analogue = self.__analogue
+        pad = next((p for p in self.__joysticks.values() if p.attached()), None)
+        if pad is None or not pg.key.get_focused():
+            self.__neutral_required = True
+            analogue.stop()
+            self.__car.stop()
+            return
+        def axis(name):
+            return pad.get_axis(name) / 32768.0
+        if getattr(self, "_GameEngine__neutral_required", False):
+            analogue.stop()
+            try:
+                self.__car.drive_analogue(0, 0, round(analogue.head))
+            except (OSError, ValueError):
+                with suppress(OSError):
+                    self.__car.stop()
+                raise
+            if (axis(pg.CONTROLLER_AXIS_TRIGGERRIGHT) <= 0.04
+                    and axis(pg.CONTROLLER_AXIS_TRIGGERLEFT) <= 0.04
+                    and abs(axis(pg.CONTROLLER_AXIS_LEFTX)) <= 0.08):
+                self.__neutral_required = False
+            else:
+                pg.display.set_caption("Stopped after control error — release triggers and steering")
+            return
+        camera = 0 if pad.get_button(pg.CONTROLLER_BUTTON_X) else axis(pg.CONTROLLER_AXIS_RIGHTX)
+        left, right, head = analogue.update(
+            max(0, axis(pg.CONTROLLER_AXIS_TRIGGERRIGHT)),
+            max(0, axis(pg.CONTROLLER_AXIS_TRIGGERLEFT)),
+            axis(pg.CONTROLLER_AXIS_LEFTX),
+            camera,
+            time.monotonic())
+        try:
+            self.__car.drive_analogue(left, right, head)
+            self.__trace_camera_command(camera, head)
+        except Exception:
+            analogue.stop()
+            with suppress(OSError):
+                self.__car.stop()
+            raise
 
-            reset_head_pos = 2 in buttons  # 2 is the X button
-            move_command_received = (
-                abs(lr_axis) > 0.2
-                or abs(fb_axis) > 0.2
-                or abs(head_axis) > 0.2
-                or reset_head_pos
-                or (num_hats > 0 and (hat[0] != 0 or hat[1] != 0))
-            )
+    def __trace_camera_command(self, stick, head):
+        if not getattr(self, "_GameEngine__trace_camera", False):
+            return
+        now = time.monotonic()
+        last_time, last_head = getattr(self, "_GameEngine__last_camera_trace", (-float("inf"), None))
+        if head != last_head or now-last_time >= 1:
+            print(f"Camera {time.strftime('%H:%M:%S')} stick={stick:+.4f} "
+                  f"acknowledged_target={head+90}deg", flush=True)
+            self.__last_camera_trace = (now, head)
 
-            if not move_command_received:
-                return move_command_received
+    def __handle_controller_player_actions(self) -> bool:
+        for pad in self.__joysticks.values():
+            if not pad.attached():
+                continue
+            # SDL's named axes normalize USB/receiver/Bluetooth mappings.
+            lr = pad.get_axis(pg.CONTROLLER_AXIS_LEFTX) / 32768.0
+            fb = pad.get_axis(pg.CONTROLLER_AXIS_LEFTY) / 32768.0
+            head = pad.get_axis(pg.CONTROLLER_AXIS_RIGHTX) / 32768.0
+            trigger = max(0.0, min(1.0,
+                pad.get_axis(pg.CONTROLLER_AXIS_TRIGGERRIGHT) / 32767.0))
+            centre = pad.get_button(pg.CONTROLLER_BUTTON_X)
+            if centre or abs(head) > self.__axis_thr:
+                # The upstream command queue accepts one action per iteration.
+                # Stop before panning so a previous drive command cannot persist.
+                self.__car.stop()
+                if centre:
+                    self.__car.set_head_angle(lazy=True)
+                else:
+                    self.__car.turn_head(self.__head_delta if head < 0
+                                         else -self.__head_delta, lazy=True)
+                return True
 
-            if head_axis < -self.__axis_thr:
-                self.__car.turn_head(self.__head_delta, lazy=True)
-                return move_command_received
-            if head_axis > self.__axis_thr:
-                self.__car.turn_head(-self.__head_delta, lazy=True)
-                return move_command_received
-            if reset_head_pos:
-                self.__car.set_head_angle(lazy=True)
-                return move_command_received
-
-            if num_hats > 0:
-                if hat[0] < 0:
-                    self.__car.left(speed=cur_speed, lazy=True)
-                    return move_command_received
-                if hat[0] > 0:
-                    self.__car.right(speed=cur_speed, lazy=True)
-                    return move_command_received
-                if hat[1] > 0:
-                    self.__car.forward(speed=cur_speed, lazy=True)
-                    return move_command_received
-                if hat[1] < 0:
-                    self.__car.backward(speed=cur_speed, lazy=True)
-                    return move_command_received
-
-            if abs(lr_axis) < self.__small_axis_thr:
-                if fb_axis > self.__axis_thr:
-                    self.__car.backward(speed=cur_speed, lazy=True)
-                elif fb_axis < -self.__axis_thr:
-                    self.__car.forward(speed=cur_speed, lazy=True)
-                return move_command_received
-
-            if fb_axis > 0:
-                if lr_axis < 0:
-                    self.__car.backward_left(speed=cur_speed, lazy=True)
-                elif lr_axis > 0:
-                    self.__car.backward_right(speed=cur_speed, lazy=True)
-                return move_command_received
-
-            if fb_axis < 0:
-                if lr_axis < 0:
-                    self.__car.forward_left(speed=cur_speed, lazy=True)
-                elif lr_axis > 0:
-                    self.__car.forward_right(speed=cur_speed, lazy=True)
-                return move_command_received
-
-            command_received |= move_command_received
-
-        return command_received
+            dx = int(pad.get_button(pg.CONTROLLER_BUTTON_DPAD_RIGHT)) - int(
+                pad.get_button(pg.CONTROLLER_BUTTON_DPAD_LEFT))
+            dy = int(pad.get_button(pg.CONTROLLER_BUTTON_DPAD_DOWN)) - int(
+                pad.get_button(pg.CONTROLLER_BUTTON_DPAD_UP))
+            if dx or dy:
+                magnitude = 1.0
+            else:
+                deadzone = 0.2
+                dx = (1 if lr > deadzone else -1 if lr < -deadzone else 0)
+                dy = (1 if fb > deadzone else -1 if fb < -deadzone else 0)
+                if not (dx or dy):
+                    continue  # An idle pad must not hide another active pad.
+                magnitude = min(1.0, (max(abs(lr), abs(fb)) - deadzone) / (1-deadzone))
+            ceiling = self.__min_speed + trigger * self.__delta_speed
+            speed = round(self.__min_speed + magnitude * (ceiling-self.__min_speed))
+            action = {
+                (0, -1): self.__car.forward, (0, 1): self.__car.backward,
+                (-1, 0): self.__car.left, (1, 0): self.__car.right,
+                (-1, -1): self.__car.forward_left, (1, -1): self.__car.forward_right,
+                (-1, 1): self.__car.backward_left, (1, 1): self.__car.backward_right,
+            }[dx, dy]
+            action(speed=speed, lazy=True)
+            return True
+        return False
 
     def __handle_terminal_input(self) -> None:
         print("Options:")
@@ -318,7 +413,16 @@ class GameEngine:
             self.__car.set_mode(user_choice)
 
     def release_resources(self):
-        self.__car.disconnect()
+        try:
+            with suppress(OSError):
+                self.__car.stop()
+        finally:
+            self.__car.disconnect()
+            for pad in getattr(self, "_GameEngine__joysticks", {}).values():
+                pad.quit()
+            video = getattr(self, "_GameEngine__video", None)
+            if video is not None:
+                video.close()
 
 
 def main() -> None:
@@ -354,6 +458,12 @@ def main() -> None:
         action="store_true",
         help="Print the version and exit.",
     )
+    parser.add_argument("--video", choices=("udp", "http"), default="http",
+                        help="Video transport (default: http; udp requires local UDP camera firmware).")
+    parser.add_argument("--analogue-drive", action="store_true",
+                        help="Trigger throttle + proportional steering/pan; requires new paired firmware.")
+    parser.add_argument("--trace-camera", action="store_true",
+                        help="Log acknowledged analogue camera targets on change and once per second.")
     args = parser.parse_args()
 
     if args.version_requested:
@@ -367,7 +477,7 @@ def main() -> None:
     pg.init()
 
     with GameEngine(
-        args.robot_ip, log=args.log, dry_run=args.dry_run
+        args.robot_ip, log=args.log, dry_run=args.dry_run, video=args.video, analogue_drive=args.analogue_drive, trace_camera=args.trace_camera
     ) as engine:
         engine.run()
 

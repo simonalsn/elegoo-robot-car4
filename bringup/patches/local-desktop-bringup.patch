@@ -1,0 +1,1408 @@
+diff --git a/src/elegoo_robot_car4/car.py b/src/elegoo_robot_car4/car.py
+index ed641e9..c978496 100644
+--- a/src/elegoo_robot_car4/car.py
++++ b/src/elegoo_robot_car4/car.py
+@@ -2,6 +2,7 @@
+ import json
+ import re
+ import socket
++import time
+ from collections import deque
+ from collections.abc import Callable
+ from contextlib import AbstractContextManager, suppress
+@@ -15,6 +16,10 @@ from ultralytics.engine.model import Model
+ from ultralytics.engine.results import Results
+ 
+ 
++class ControlProtocolError(OSError):
++    """A control reply was corrupted; its acknowledgement cannot be trusted."""
++
++
+ class Car(AbstractContextManager):
+     """
+     Controller of the Elegoo Smart Robot Car v4.0.
+@@ -100,6 +105,10 @@ class Car(AbstractContextManager):
+         self.__dry_run = dry_run
+         self.__cmd_queue = deque()
+         self.__recv_msg_queue = ""
++        self.__command_ready_at = 0.0
++        self.__serial_baud = 9600
++        self.__drive_sequence = 0
++        self.__analogue_ready = False
+         self.__head_servo_angle = 90
+         self.__a_offsets = np.zeros(3)
+         self.__g_offsets = np.zeros(3)
+@@ -181,9 +190,15 @@ class Car(AbstractContextManager):
+         """
+         if self.__dry_run:
+             return np.array([])
+-        r = req.get(self.__capture_endpoint)
+-        frame = np.asarray(bytearray(r.content), dtype=np.int8)
+-        return cv.imdecode(frame, cv.IMREAD_UNCHANGED)
++        r = req.get(self.__capture_endpoint, timeout=(2, 3))
++        r.raise_for_status()
++        if not (r.content.startswith(b"\xff\xd8") and r.content.endswith(b"\xff\xd9")):
++            raise ValueError("Incomplete camera JPEG")
++        frame = np.frombuffer(r.content, dtype=np.uint8)
++        decoded = cv.imdecode(frame, cv.IMREAD_UNCHANGED)
++        if decoded is None:
++            raise ValueError("Camera JPEG could not be decoded")
++        return decoded
+ 
+     def track(self, frame: np.ndarray, **kwargs) -> list[Results]:
+         """
+@@ -387,6 +402,29 @@ class Car(AbstractContextManager):
+         expected_pattern = f"{{{cmd_id}_ok}}"
+         self.__recv_until_confirmation(expected_pattern)
+ 
++    def enable_analogue_drive(self):
++        """Require the new firmware before sending any signed-wheel commands."""
++        self.__send_cmd({"H": "cap", "N": 1002})
++        try:
++            reply = self.__recv_until_confirmation(r"\{drive_v(?:1|2_38400)\}")
++        except (OSError, ValueError) as exc:
++            raise RuntimeError("Analogue drive requires paired analogue-drive UNO/ESP32 firmware") from exc
++        if not self.__dry_run:
++            self.__socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
++        self.__serial_baud = 38400 if "2_38400" in reply else 115200
++        self.__analogue_ready = True
++
++    def drive_analogue(self, left: int, right: int, head: int):
++        """One acknowledged wheel/pan update; firmware expires it after 400 ms."""
++        if not self.__analogue_ready:
++            raise RuntimeError("Analogue drive firmware handshake has not succeeded")
++        if not (-200 <= left <= 200 and -200 <= right <= 200 and -80 <= head <= 80):
++            raise ValueError("Wheel or camera command outside supported range")
++        self.__drive_sequence = (self.__drive_sequence + 1) & 0xffff
++        self.__process_cmd({"H": f"d{self.__drive_sequence}", "N": 1001,
++                            "D1": int(left), "D2": int(right), "D3": int(head)+90}, False)
++        self.__head_servo_angle = int(head)+90
++
+     def forward(self, speed: int = 50, lazy: bool = False) -> None:
+         """
+         Moves forward.
+@@ -745,9 +783,14 @@ class Car(AbstractContextManager):
+         self.__state = new_state
+ 
+     def __send_cmd(self, cmd_data: dict) -> None:
+-        json_cmd = json.dumps(cmd_data).encode()
++        json_cmd = (json.dumps(cmd_data, separators=(",", ":")) if self.__analogue_ready
++                    else json.dumps(cmd_data)).encode()
+         if not self.__dry_run:
++            # Use the negotiated UART speed; legacy firmware remains at 9600.
++            # In particular, leave room after commands with no response.
++            time.sleep(max(0.0, self.__command_ready_at - time.monotonic()))
+             self.__socket.sendall(json_cmd)
++            self.__command_ready_at = time.monotonic() + len(json_cmd) * 10 / self.__serial_baud + (0.002 if self.__analogue_ready else 0.03)
+         if self.log:  # pragma: no cover
+             print(f"Sent command: {json_cmd}")
+ 
+@@ -756,8 +799,30 @@ class Car(AbstractContextManager):
+             return ""
+         pattern = re.compile(expected_confirmation)
+         m = pattern.search(self.__recv_msg_queue)
++        deadline = time.monotonic() + 2.0
+         while not m:
+-            self.__recv_msg_queue += self.__socket.recv(4096).decode()
++            remaining = deadline - time.monotonic()
++            if remaining <= 0:
++                raise TimeoutError("Robot command response timed out")
++            self.__socket.settimeout(remaining)
++            try:
++                received = self.__socket.recv(4096)
++            finally:
++                self.__socket.settimeout(2)
++            if not received:
++                raise ConnectionError("Robot closed the control connection")
++            try:
++                decoded = received.decode("ascii")
++                if any(ord(c) < 32 and c not in "\r\n\t" for c in decoded):
++                    raise ValueError("non-text control bytes")
++            except (UnicodeDecodeError, ValueError) as exc:
++                self.__recv_msg_queue = ""
++                raise ControlProtocolError(
++                    f"Corrupt serial control reply (hex: {received[:96].hex()})") from exc
++            self.__recv_msg_queue += decoded
++            if len(self.__recv_msg_queue) > 16384:
++                self.__recv_msg_queue = ""
++                raise ControlProtocolError("Control reply buffer exceeded its limit")
+             # Remove all received {Heartbeat} messages
+             self.__recv_msg_queue = self.__heartbeat_re.sub(
+                 "", self.__recv_msg_queue
+diff --git a/src/elegoo_robot_car4/elegoo_smartcar_control.py b/src/elegoo_robot_car4/elegoo_smartcar_control.py
+index 3269509..f8849f9 100644
+--- a/src/elegoo_robot_car4/elegoo_smartcar_control.py
++++ b/src/elegoo_robot_car4/elegoo_smartcar_control.py
+@@ -2,21 +2,27 @@
+ 
+ import argparse
+ import functools as fun
++import time
++from contextlib import suppress
+ from collections.abc import Callable
+ from typing import Any
+ 
+ import cv2 as cv
+ import numpy as np
+ import pygame as pg
++from pygame._sdl2 import controller as gamecontroller
++import requests
+ from ultralytics.engine.results import Results
+ 
+ from .__init__ import __version__
+ from .car import Car
+ from .person_follower import PersonFollower
++from .udp_video import UdpVideo
++from .analogue_drive import AnalogueDrive
+ 
+ 
+ class GameEngine:
+-    __joysticks: dict[int, pg.joystick.JoystickType]
++    __joysticks: dict[int, gamecontroller.Controller]
+     __head_delta: int = 10
+     __min_speed: int = 50
+     __max_speed: int = 200
+@@ -44,7 +50,7 @@ class GameEngine:
+     __person_follower: PersonFollower
+     __run_person_follower: bool
+ 
+-    def __init__(self, robot_ip: str, log: bool = False, dry_run: bool = False):
++    def __init__(self, robot_ip: str, log: bool = False, dry_run: bool = False, video: str = "http", analogue_drive: bool = False, trace_camera: bool = False):
+         """
+         Constructor.
+ 
+@@ -56,15 +62,27 @@ class GameEngine:
+             dry_run:    Set this to True for debugging purpose (no socket call
+                         will be actually made).
+         """
++        gamecontroller.init()
+         self.__joysticks = {}
+         self.__dry_run = dry_run
+         self.__autonomous_mode = False
+         self.__run_person_follower = False
+         self.__car = Car(ip=robot_ip, log=log, dry_run=dry_run)
++        self.__analogue = AnalogueDrive() if analogue_drive else None
++        self.__neutral_required = False
++        self.__trace_camera = trace_camera
++        if analogue_drive:
++            try:
++                self.__car.enable_analogue_drive()
++            except Exception:
++                self.__car.disconnect()
++                raise
+         self.__last_track_results = []
++        self.__video = UdpVideo(robot_ip) if video == "udp" and not dry_run else None
++        # UDP starts asynchronously; no HTTP capture before the window opens.
+         # capture shape (height, width), OpenCV format
+         capture_shape = np.array(
+-            self.__dry_run_size if dry_run else self.__car.capture().shape[:2]
++            self.__dry_run_size if dry_run else ((600, 800) if self.__video else self.__car.capture().shape[:2])
+         )
+         # pygame requires frames in (width, height) format
+         display_size = self.__dry_run_size if dry_run else capture_shape[::-1]
+@@ -82,14 +100,27 @@ class GameEngine:
+     def __exit__(self, exc_type, exc_val, exc_tb):
+         self.release_resources()
+ 
+-    def __display_new_frame(self) -> None:
++    def __display_new_frame(self) -> bool | None:
+         if self.__dry_run:
+             return
+-        frame = self.__car.capture()
++        if self.__video is not None:
++            frame, age = self.__video.latest()
++            if frame is None or age > 0.75:
++                # Never drive using a frozen image. Keep the window responsive
++                # while waiting for the subscription or recovering packet loss.
++                self.__display.fill((25, 25, 25))
++                pg.display.update()
++                return False
++        else:
++            frame = self.__car.capture()
+         frame = self.__process_frame(frame)
++        if self.__display.get_size() != frame.shape[:2]:
++            self.__display = pg.display.set_mode(frame.shape[:2])
++            self.__person_follower = PersonFollower(self.__car, np.array(frame.shape[:2][::-1]))
+         # blit it to the display surface.  simple!
+         pg.surfarray.blit_array(self.__display, frame)
+         pg.display.update()
++        return True
+ 
+     def __process_frame(self, frame: np.ndarray) -> np.ndarray:
+         if self.__car.vision_tracking_is_on:
+@@ -114,17 +145,64 @@ class GameEngine:
+         Runs the game loop, translating player commands to the robot.
+         """
+ 
++        clock = pg.time.Clock()
++        failures = 0
++        ground_checked = 0.0
++        raised = True
+         while True:
+-            self.__display_new_frame()
++            analogue = getattr(self, "_GameEngine__analogue", None)
++            clock.tick(30 if analogue else 10)
+             events = pg.event.get()
+-            if any([e.type == pg.QUIT for e in events]):
++            if any(e.type == pg.QUIT or (e.type == pg.KEYDOWN and e.key == pg.K_ESCAPE)
++                   for e in events):
+                 break
+-
+-            if self.__car.is_far_from_the_ground():
++            self.__detect_relevant_events(events)
++            try:
++                if self.__display_new_frame() is False:
++                    self.__car.stop()
++                    if analogue:
++                        analogue.stop()
++                    pg.display.set_caption("UDP video unavailable/stale — driving blocked; Esc exits")
++                    continue
++                if not analogue or time.monotonic() - ground_checked >= 0.1:
++                    raised = not self.__dry_run and self.__car.is_far_from_the_ground()
++                    ground_checked = time.monotonic()
++            except (OSError, ValueError, requests.RequestException, cv.error) as exc:
++                with suppress(OSError):
++                    self.__car.stop()
++                if analogue:
++                    analogue.stop()
++                    self.__neutral_required = True
++                failures += 1
++                pg.display.set_caption("Connection/camera error — stop requested")
++                print(f"Connection/camera error; stop requested: {exc}", flush=True)
++                if failures >= 3 and not analogue:
++                    raise RuntimeError("Repeated robot connection/camera failures") from exc
++                continue
++            failures = 0
++            if raised:
+                 self.__car.stop()
++                if analogue:
++                    analogue.stop()
++                pg.display.set_caption("Car raised: driving blocked — place on floor; Esc exits")
++                continue
++            pg.display.set_caption(
++                "RT forward | LT reverse | both stop | left stick steer | right stick camera | Esc exits"
++                if analogue else "Elegoo Smart Robot Car v4.0 controller — arrow keys drive")
++
++            if analogue:
++                # This mode sends one combined, leased drive/pan command. Do not
++                # mix legacy keyboard/autonomous commands into that transaction.
++                try:
++                    self.__handle_analogue_actions()
++                except (OSError, ValueError) as exc:
++                    analogue.stop()
++                    self.__neutral_required = True
++                    pg.display.set_caption("Control reply failed — stopped; release triggers and steering")
++                    print(f"Control reply failed; stop requested. Release triggers and steering. {exc}", flush=True)
++                    # __handle_analogue_actions has already requested stop.
++                    # Never replay the failed drive demand; recover with zero only.
+                 continue
+-
+-            joystick_buttons = self.__detect_relevant_events(events)
+ 
+             keyboard_player_actions = self.__handle_keyboard_player_actions()
+             if keyboard_player_actions["command_received"] == "finish":
+@@ -132,9 +210,7 @@ class GameEngine:
+ 
+             move_command_received = keyboard_player_actions[
+                 "command_received"
+-            ] == "movement" or self.__handle_controller_player_actions(
+-                joystick_buttons
+-            )
++            ] == "movement" or self.__handle_controller_player_actions()
+ 
+             if not self.__autonomous_mode:
+                 if not move_command_received:
+@@ -147,23 +223,25 @@ class GameEngine:
+             if self.__run_person_follower:
+                 self.__person_follower.follow(self.__last_track_results)
+ 
+-    def __detect_relevant_events(self, events: list[pg.Event]) -> list[int]:
+-        joystick_buttons = []
++    def __detect_relevant_events(self, events: list[pg.Event]) -> None:
++        # Process hotplug even while raised or waiting for video. Otherwise the
++        # initial connection event is consumed and the pad is never registered.
+         for e in events:
+-            # Handle hotplugging
+             if e.type == pg.JOYDEVICEADDED:
+-                # This event will be generated for every joystick when the
+-                # program starts, filling up the list without needing to
+-                # create them manually.
+-                joy = pg.joystick.Joystick(e.device_index)
+-                self.__joysticks[joy.get_instance_id()] = joy
+-
+-            if e.type == pg.JOYDEVICEREMOVED:
+-                del self.__joysticks[e.instance_id]
+-
+-            if e.type == pg.JOYBUTTONDOWN:
+-                joystick_buttons += [e.button]
+-        return joystick_buttons
++                if not gamecontroller.is_controller(e.device_index):
++                    print("Gamepad has no SDL mapping; ignoring it instead of guessing axes.")
++                    continue
++                pad = gamecontroller.Controller(e.device_index)
++                ident = pad.as_joystick().get_instance_id()
++                self.__joysticks[ident] = pad
++                controls = ("RT forward; LT reverse; both stop; left stick steers; right stick aims camera."
++                            if getattr(self, "_GameEngine__analogue", None) else
++                            "Left stick/D-pad drive; RT adds speed; right stick pans; X centres camera.")
++                print(f"Gamepad connected: {pad.name}. {controls}", flush=True)
++            elif e.type == pg.JOYDEVICEREMOVED:
++                pad = self.__joysticks.pop(e.instance_id, None)
++                if pad is not None:
++                    pad.quit()
+ 
+     def __handle_keyboard_player_actions(self) -> dict[str, int | str | None]:
+         retval: dict[str, int | str | None] = {
+@@ -186,86 +264,103 @@ class GameEngine:
+                     break
+         return retval
+ 
+-    def __handle_controller_player_actions(self, buttons: list[int]) -> bool:
+-        command_received = False
+-        for stick in self.__joysticks.values():
+-            lr_axis = stick.get_axis(0)
+-            fb_axis = stick.get_axis(1)
+-            head_axis = stick.get_axis(3)
+-            num_hats = stick.get_numhats()
+-            hat = stick.get_hat(0) if num_hats > 0 else None
+-            # Use right trigger for tuning speed
+-            speed_axis = 0.5 * (
+-                stick.get_axis(5) + 1.0
+-            )  # Now this is a number in [0,1]
+-            cur_speed = round(
+-                np.clip(
+-                    self.__min_speed + speed_axis * self.__delta_speed,
+-                    a_min=0,
+-                    a_max=255,
+-                )
+-            )
+-
+-            reset_head_pos = 2 in buttons  # 2 is the X button
+-            move_command_received = (
+-                abs(lr_axis) > 0.2
+-                or abs(fb_axis) > 0.2
+-                or abs(head_axis) > 0.2
+-                or reset_head_pos
+-                or (num_hats > 0 and (hat[0] != 0 or hat[1] != 0))
+-            )
++    def __handle_analogue_actions(self):
++        analogue = self.__analogue
++        pad = next((p for p in self.__joysticks.values() if p.attached()), None)
++        if pad is None or not pg.key.get_focused():
++            self.__neutral_required = True
++            analogue.stop()
++            self.__car.stop()
++            return
++        def axis(name):
++            return pad.get_axis(name) / 32768.0
++        if getattr(self, "_GameEngine__neutral_required", False):
++            analogue.stop()
++            try:
++                self.__car.drive_analogue(0, 0, round(analogue.head))
++            except (OSError, ValueError):
++                with suppress(OSError):
++                    self.__car.stop()
++                raise
++            if (axis(pg.CONTROLLER_AXIS_TRIGGERRIGHT) <= 0.04
++                    and axis(pg.CONTROLLER_AXIS_TRIGGERLEFT) <= 0.04
++                    and abs(axis(pg.CONTROLLER_AXIS_LEFTX)) <= 0.08):
++                self.__neutral_required = False
++            else:
++                pg.display.set_caption("Stopped after control error — release triggers and steering")
++            return
++        camera = 0 if pad.get_button(pg.CONTROLLER_BUTTON_X) else axis(pg.CONTROLLER_AXIS_RIGHTX)
++        left, right, head = analogue.update(
++            max(0, axis(pg.CONTROLLER_AXIS_TRIGGERRIGHT)),
++            max(0, axis(pg.CONTROLLER_AXIS_TRIGGERLEFT)),
++            axis(pg.CONTROLLER_AXIS_LEFTX),
++            camera,
++            time.monotonic())
++        try:
++            self.__car.drive_analogue(left, right, head)
++            self.__trace_camera_command(camera, head)
++        except Exception:
++            analogue.stop()
++            with suppress(OSError):
++                self.__car.stop()
++            raise
+ 
+-            if not move_command_received:
+-                return move_command_received
+-
+-            if head_axis < -self.__axis_thr:
+-                self.__car.turn_head(self.__head_delta, lazy=True)
+-                return move_command_received
+-            if head_axis > self.__axis_thr:
+-                self.__car.turn_head(-self.__head_delta, lazy=True)
+-                return move_command_received
+-            if reset_head_pos:
+-                self.__car.set_head_angle(lazy=True)
+-                return move_command_received
+-
+-            if num_hats > 0:
+-                if hat[0] < 0:
+-                    self.__car.left(speed=cur_speed, lazy=True)
+-                    return move_command_received
+-                if hat[0] > 0:
+-                    self.__car.right(speed=cur_speed, lazy=True)
+-                    return move_command_received
+-                if hat[1] > 0:
+-                    self.__car.forward(speed=cur_speed, lazy=True)
+-                    return move_command_received
+-                if hat[1] < 0:
+-                    self.__car.backward(speed=cur_speed, lazy=True)
+-                    return move_command_received
+-
+-            if abs(lr_axis) < self.__small_axis_thr:
+-                if fb_axis > self.__axis_thr:
+-                    self.__car.backward(speed=cur_speed, lazy=True)
+-                elif fb_axis < -self.__axis_thr:
+-                    self.__car.forward(speed=cur_speed, lazy=True)
+-                return move_command_received
+-
+-            if fb_axis > 0:
+-                if lr_axis < 0:
+-                    self.__car.backward_left(speed=cur_speed, lazy=True)
+-                elif lr_axis > 0:
+-                    self.__car.backward_right(speed=cur_speed, lazy=True)
+-                return move_command_received
+-
+-            if fb_axis < 0:
+-                if lr_axis < 0:
+-                    self.__car.forward_left(speed=cur_speed, lazy=True)
+-                elif lr_axis > 0:
+-                    self.__car.forward_right(speed=cur_speed, lazy=True)
+-                return move_command_received
+-
+-            command_received |= move_command_received
+-
+-        return command_received
++    def __trace_camera_command(self, stick, head):
++        if not getattr(self, "_GameEngine__trace_camera", False):
++            return
++        now = time.monotonic()
++        last_time, last_head = getattr(self, "_GameEngine__last_camera_trace", (-float("inf"), None))
++        if head != last_head or now-last_time >= 1:
++            print(f"Camera {time.strftime('%H:%M:%S')} stick={stick:+.4f} "
++                  f"acknowledged_target={head+90}deg", flush=True)
++            self.__last_camera_trace = (now, head)
++
++    def __handle_controller_player_actions(self) -> bool:
++        for pad in self.__joysticks.values():
++            if not pad.attached():
++                continue
++            # SDL's named axes normalize USB/receiver/Bluetooth mappings.
++            lr = pad.get_axis(pg.CONTROLLER_AXIS_LEFTX) / 32768.0
++            fb = pad.get_axis(pg.CONTROLLER_AXIS_LEFTY) / 32768.0
++            head = pad.get_axis(pg.CONTROLLER_AXIS_RIGHTX) / 32768.0
++            trigger = max(0.0, min(1.0,
++                pad.get_axis(pg.CONTROLLER_AXIS_TRIGGERRIGHT) / 32767.0))
++            centre = pad.get_button(pg.CONTROLLER_BUTTON_X)
++            if centre or abs(head) > self.__axis_thr:
++                # The upstream command queue accepts one action per iteration.
++                # Stop before panning so a previous drive command cannot persist.
++                self.__car.stop()
++                if centre:
++                    self.__car.set_head_angle(lazy=True)
++                else:
++                    self.__car.turn_head(self.__head_delta if head < 0
++                                         else -self.__head_delta, lazy=True)
++                return True
++
++            dx = int(pad.get_button(pg.CONTROLLER_BUTTON_DPAD_RIGHT)) - int(
++                pad.get_button(pg.CONTROLLER_BUTTON_DPAD_LEFT))
++            dy = int(pad.get_button(pg.CONTROLLER_BUTTON_DPAD_DOWN)) - int(
++                pad.get_button(pg.CONTROLLER_BUTTON_DPAD_UP))
++            if dx or dy:
++                magnitude = 1.0
++            else:
++                deadzone = 0.2
++                dx = (1 if lr > deadzone else -1 if lr < -deadzone else 0)
++                dy = (1 if fb > deadzone else -1 if fb < -deadzone else 0)
++                if not (dx or dy):
++                    continue  # An idle pad must not hide another active pad.
++                magnitude = min(1.0, (max(abs(lr), abs(fb)) - deadzone) / (1-deadzone))
++            ceiling = self.__min_speed + trigger * self.__delta_speed
++            speed = round(self.__min_speed + magnitude * (ceiling-self.__min_speed))
++            action = {
++                (0, -1): self.__car.forward, (0, 1): self.__car.backward,
++                (-1, 0): self.__car.left, (1, 0): self.__car.right,
++                (-1, -1): self.__car.forward_left, (1, -1): self.__car.forward_right,
++                (-1, 1): self.__car.backward_left, (1, 1): self.__car.backward_right,
++            }[dx, dy]
++            action(speed=speed, lazy=True)
++            return True
++        return False
+ 
+     def __handle_terminal_input(self) -> None:
+         print("Options:")
+@@ -318,7 +413,16 @@ class GameEngine:
+             self.__car.set_mode(user_choice)
+ 
+     def release_resources(self):
+-        self.__car.disconnect()
++        try:
++            with suppress(OSError):
++                self.__car.stop()
++        finally:
++            self.__car.disconnect()
++            for pad in getattr(self, "_GameEngine__joysticks", {}).values():
++                pad.quit()
++            video = getattr(self, "_GameEngine__video", None)
++            if video is not None:
++                video.close()
+ 
+ 
+ def main() -> None:
+@@ -354,6 +458,12 @@ def main() -> None:
+         action="store_true",
+         help="Print the version and exit.",
+     )
++    parser.add_argument("--video", choices=("udp", "http"), default="http",
++                        help="Video transport (default: http; udp requires local UDP camera firmware).")
++    parser.add_argument("--analogue-drive", action="store_true",
++                        help="Trigger throttle + proportional steering/pan; requires new paired firmware.")
++    parser.add_argument("--trace-camera", action="store_true",
++                        help="Log acknowledged analogue camera targets on change and once per second.")
+     args = parser.parse_args()
+ 
+     if args.version_requested:
+@@ -367,7 +477,7 @@ def main() -> None:
+     pg.init()
+ 
+     with GameEngine(
+-        args.robot_ip, log=args.log, dry_run=args.dry_run
++        args.robot_ip, log=args.log, dry_run=args.dry_run, video=args.video, analogue_drive=args.analogue_drive, trace_camera=args.trace_camera
+     ) as engine:
+         engine.run()
+ 
+diff --git a/src/elegoo_robot_car4/udp_video.py b/src/elegoo_robot_car4/udp_video.py
+new file mode 100644
+index 0000000..5154316
+--- /dev/null
++++ b/src/elegoo_robot_car4/udp_video.py
+@@ -0,0 +1,125 @@
++"""Bounded, latest-frame-only JPEG-over-UDP receiver for the local camera firmware."""
++import select
++import secrets
++import socket
++import struct
++import threading
++import time
++
++import cv2 as cv
++import numpy as np
++
++HEADER = struct.Struct('!4sIIIHH')
++CHUNK = 1200
++MAX_FRAME = 262144
++
++
++class FrameAssembler:
++    """Accept reordered fragments within one frame; never wait for a lost fragment."""
++
++    def __init__(self, token):
++        self.token = token
++        self.sequence = None
++        self.parts = {}
++        self.started = 0.0
++        self.total = 0
++        self.count = 0
++        self.finished = False
++
++    def feed(self, packet, now):
++        if len(packet) < HEADER.size:
++            return None
++        magic, token, sequence, total, index, count = HEADER.unpack_from(packet)
++        if (magic != b'EVF1' or token != self.token or not 4 <= total <= MAX_FRAME
++                or count != (total + CHUNK - 1) // CHUNK or index >= count):
++            return None
++        payload = packet[HEADER.size:]
++        if len(payload) != min(CHUNK, total - index * CHUNK):
++            return None
++        if self.sequence is None or 0 < ((sequence - self.sequence) & 0xffffffff) < 0x80000000:
++            self.sequence, self.total, self.count = sequence, total, count
++            self.started, self.finished, self.parts = now, False, {}
++        if (sequence != self.sequence or self.finished or total != self.total
++                or count != self.count):
++            return None
++        if now - self.started > 0.25:
++            self.parts.clear()
++            self.finished = True
++            return None
++        self.parts[index] = payload
++        if len(self.parts) != count:
++            return None
++        jpeg = b''.join(self.parts[i] for i in range(count))
++        self.parts.clear()
++        self.finished = True
++        if jpeg.startswith(b'\xff\xd8') and jpeg.endswith(b'\xff\xd9'):
++            return jpeg
++        return None
++
++
++class UdpVideo:
++    def __init__(self, host, port=5000):
++        self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
++        self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 262144)
++        self._socket.settimeout(0.05)
++        self._socket.connect((host, port))  # filters packets and replies through same firewall tuple
++        self._token = secrets.randbits(32)
++        self._assembler = FrameAssembler(self._token)
++        self._stop = threading.Event()
++        self._lock = threading.Lock()
++        self._latest = None
++        self.error = None
++        self.frames = 0
++        self._thread = threading.Thread(target=self._run, name='udp-video', daemon=True)
++        self._thread.start()
++
++    def _run(self):
++        renewed = 0.0
++        while not self._stop.is_set():
++            try:
++                now = time.monotonic()
++                if now - renewed >= 0.5:
++                    self._socket.send(struct.pack('!4sI', b'EVS1', self._token))
++                    renewed = now
++                packet = self._socket.recv(HEADER.size + CHUNK + 1)
++                jpeg = self._assembler.feed(packet, time.monotonic())
++                # Drain already-arrived packets before decoding: drop superseded
++                # complete frames instead of letting a decode queue build up.
++                for _ in range(256):
++                    if not select.select([self._socket], [], [], 0)[0]:
++                        break
++                    packet = self._socket.recv(HEADER.size + CHUNK + 1)
++                    completed = self._assembler.feed(packet, time.monotonic())
++                    if completed is not None:
++                        jpeg = completed
++                if jpeg is None:
++                    continue
++                frame = cv.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv.IMREAD_COLOR)
++                if frame is not None:
++                    with self._lock:
++                        self._latest = (frame, time.monotonic())
++                        self.frames += 1
++                    self.error = None
++            except socket.timeout:
++                pass
++            except (OSError, cv.error) as exc:
++                self.error = str(exc)
++                self._stop.wait(0.05)
++
++    def latest(self):
++        """Return (frame, local receive age), without waiting for network input."""
++        with self._lock:
++            if self._latest is None:
++                return None, float('inf')
++            frame, received = self._latest
++            return frame, time.monotonic() - received
++
++    def close(self):
++        self._stop.set()
++        self._thread.join(timeout=1)
++        try:
++            self._socket.send(struct.pack('!4sI', b'EVX1', self._token))
++        except OSError:
++            pass  # firmware subscription also expires after three seconds
++        finally:
++            self._socket.close()
+diff --git a/src/elegoo_robot_car4/analogue_drive.py b/src/elegoo_robot_car4/analogue_drive.py
+new file mode 100644
+index 0000000..3ca8153
+--- /dev/null
++++ b/src/elegoo_robot_car4/analogue_drive.py
+@@ -0,0 +1,74 @@
++"""Pure gamepad mixing and time-based smoothing; no hardware access."""
++from dataclasses import dataclass
++import math
++
++
++def deadzone(value: float, width: float) -> float:
++    value = max(-1.0, min(1.0, value))
++    return math.copysign(max(0.0, (abs(value)-width)/(1-width)), value)
++
++
++def expo(value: float) -> float:
++    """Cubic response, preserving sign and full-scale output."""
++    return value ** 3
++
++
++# Extra steering authority while driving; blend out completely for stationary pivots.
++MOVING_STEERING_FLOOR = 0.20
++STEERING_BLEND_THROTTLE = 0.25
++
++
++def mix_wheels(forward: float, reverse: float, steering: float):
++    """Return normalized L/R demand. Positive steering turns the nose right."""
++    if forward > 0.04 and reverse > 0.04:
++        return 0.0, 0.0
++    throttle = expo(deadzone(forward, 0.04)) - expo(deadzone(reverse, 0.04))
++    steer = expo(deadzone(steering, 0.08))
++    if steer != 0:
++        blend = min(1.0, abs(throttle)/STEERING_BLEND_THROTTLE)
++        floor = MOVING_STEERING_FLOOR * blend
++        steer = math.copysign(floor + (1-floor)*abs(steer), steer)
++    left, right = throttle + steer, throttle - steer
++    scale = max(1.0, abs(left), abs(right))
++    return left/scale, right/scale
++
++
++# User-tuned minimum moving-wheel output, applied after mixing.
++MIN_MOVING_PWM = 30
++MAX_PWM = 200
++
++
++def motor_pwm(demand: float) -> float:
++    """Map mixed wheel demand to PWM with a minimum for each moving wheel."""
++    if abs(demand) < 1e-12:  # ignore floating-point cancellation residue
++        return 0.0
++    return math.copysign(MIN_MOVING_PWM + (MAX_PWM-MIN_MOVING_PWM)*abs(demand), demand)
++
++
++@dataclass
++class AnalogueDrive:
++    left: float = 0.0
++    right: float = 0.0
++    head: float = 0.0
++    previous_time: float | None = None
++
++    def stop(self):
++        self.left = self.right = 0.0
++        self.previous_time = None
++
++    def update(self, forward, reverse, steering, camera, now):
++        dt = 1/30 if self.previous_time is None else max(0.0, min(0.1, now-self.previous_time))
++        self.previous_time = now
++        left, right = mix_wheels(forward, reverse, steering)
++        if left == right == 0:
++            self.left = self.right = 0.0  # stop is never ramped
++        else:
++            # Scale the change vector together, preserving its direction.
++            dl, dr = motor_pwm(left)-self.left, motor_pwm(right)-self.right
++            scale = min(1.0, 800*dt/max(abs(dl), abs(dr), 1e-9))
++            self.left += dl*scale
++            self.right += dr*scale
++        target = -80*deadzone(camera, 0.08)
++        delta = max(-450*dt, min(450*dt, target-self.head))
++        self.head += delta
++        return round(self.left), round(self.right), round(self.head)
+diff --git a/tests/unit_tests/test_bringup_regressions.py b/tests/unit_tests/test_bringup_regressions.py
+new file mode 100644
+index 0000000..79bf990
+--- /dev/null
++++ b/tests/unit_tests/test_bringup_regressions.py
+@@ -0,0 +1,85 @@
++from unittest.mock import MagicMock
++
++import pygame as pg
++import pytest
++
++from elegoo_robot_car4 import Car
++from elegoo_robot_car4.elegoo_smartcar_control import GameEngine
++
++
++def test_closed_control_socket_fails_instead_of_spinning(car_mocks):
++    car_mocks["socket"].recv.return_value = b""
++    with Car() as car, pytest.raises(ConnectionError, match="closed"):
++        car.is_far_from_the_ground()
++
++
++def test_heartbeats_do_not_extend_command_deadline(car_mocks, mocker):
++    car_mocks["socket"].recv.return_value = b"{Heartbeat}"
++    with Car() as car:
++        clock = iter([0.0, 0.0, 0.0, 0.5, 1.0, 2.1])
++        mocker.patch("elegoo_robot_car4.car.time.monotonic", side_effect=clock)
++        with pytest.raises(TimeoutError, match="timed out"):
++            car.is_far_from_the_ground()
++    assert car_mocks["socket"].recv.call_count == 2
++
++
++def test_truncated_jpeg_is_rejected(car_mocks):
++    response = car_mocks["capture_request"].return_value
++    response._content = b"\xff\xd8truncated"
++    with Car() as car, pytest.raises(ValueError, match="Incomplete"):
++        car.capture()
++
++
++def engine_for_loop(mocker):
++    engine = GameEngine.__new__(GameEngine)
++    engine._GameEngine__car = MagicMock()
++    engine._GameEngine__dry_run = False
++    engine._GameEngine__car.is_far_from_the_ground.return_value = True
++    mocker.patch.object(engine, "_GameEngine__display_new_frame")
++    mocker.patch("pygame.time.Clock")
++    caption = mocker.patch("pygame.display.set_caption")
++    return engine, caption
++
++
++def test_escape_works_while_ground_guard_blocks_driving(mocker):
++    engine, caption = engine_for_loop(mocker)
++    mocker.patch("pygame.event.get", side_effect=[[], [pg.event.Event(pg.KEYDOWN, key=pg.K_ESCAPE)]])
++    engine.run()
++    engine._GameEngine__car.stop.assert_called_once()
++    engine._GameEngine__car.move.assert_not_called()
++    assert "Car raised" in caption.call_args.args[0]
++
++
++def test_bad_camera_frame_stops_then_recovers_without_driving(mocker):
++    engine, caption = engine_for_loop(mocker)
++    engine._GameEngine__display_new_frame.side_effect = [ValueError("Incomplete camera JPEG"), None]
++    mocker.patch("pygame.event.get", side_effect=[[], [], [pg.event.Event(pg.QUIT)]])
++    engine.run()
++    assert engine._GameEngine__car.stop.call_count == 2
++    engine._GameEngine__car.move.assert_not_called()
++    assert "Car raised" in caption.call_args.args[0]
++
++
++def test_cleanup_requests_stop_even_after_loop_error(mocker):
++    engine, _ = engine_for_loop(mocker)
++    engine._GameEngine__car.stop.side_effect = OSError("disconnected")
++    engine.release_resources()
++    engine._GameEngine__car.disconnect.assert_called_once()
++
++
++def test_stale_udp_video_blocks_driving_but_quit_still_works(mocker):
++    engine, caption = engine_for_loop(mocker)
++    engine._GameEngine__display_new_frame.return_value = False
++    mocker.patch("pygame.event.get", side_effect=[[], [pg.event.Event(pg.QUIT)]])
++    engine.run()
++    engine._GameEngine__car.stop.assert_called_once()
++    engine._GameEngine__car.move.assert_not_called()
++    engine._GameEngine__car.is_far_from_the_ground.assert_not_called()
++    assert "stale" in caption.call_args.args[0]
++
++
++def test_cleanup_unsubscribes_udp_video(mocker):
++    engine, _ = engine_for_loop(mocker)
++    engine._GameEngine__video = MagicMock()
++    engine.release_resources()
++    engine._GameEngine__video.close.assert_called_once()
+diff --git a/tests/unit_tests/test_udp_video.py b/tests/unit_tests/test_udp_video.py
+new file mode 100644
+index 0000000..99e22b7
+--- /dev/null
++++ b/tests/unit_tests/test_udp_video.py
+@@ -0,0 +1,92 @@
++import struct
++import socket
++import time
++
++import cv2 as cv
++import numpy as np
++
++from elegoo_robot_car4.udp_video import CHUNK, HEADER, FrameAssembler, UdpVideo
++
++
++def packets(data, seq=1, token=123):
++    count = (len(data) + CHUNK - 1) // CHUNK
++    return [HEADER.pack(b'EVF1', token, seq, len(data), i, count)
++            + data[i*CHUNK:(i+1)*CHUNK] for i in range(count)]
++
++
++def test_reordered_fragments_and_duplicates():
++    data = b'\xff\xd8' + b'x' * 3500 + b'\xff\xd9'
++    p = packets(data)
++    a = FrameAssembler(123)
++    assert a.feed(p[2], 0) is None
++    assert a.feed(p[2], 0.01) is None
++    assert a.feed(p[0], 0.02) is None
++    assert a.feed(p[1], 0.03) == data
++    assert a.feed(p[0], 0.04) is None
++
++
++def test_lost_frame_does_not_hold_up_next_frame_or_accept_old_packets():
++    data = b'\xff\xd8' + b'x' * 1300 + b'\xff\xd9'
++    a = FrameAssembler(123)
++    old, new = packets(data), packets(data, 2)
++    assert a.feed(old[0], 0) is None
++    assert a.feed(new[1], 0.1) is None
++    assert a.feed(old[1], 0.11) is None
++    assert a.feed(new[0], 0.12) == data
++
++
++def test_expired_incomplete_frame_is_never_published():
++    data = b'\xff\xd8' + b'x' * 1300 + b'\xff\xd9'
++    a = FrameAssembler(123)
++    p = packets(data)
++    assert a.feed(p[0], 0) is None
++    assert a.feed(p[1], 0.3) is None
++    assert a.feed(p[0], 0.31) is None
++
++
++def test_invalid_lengths_tokens_and_jpeg_rejected():
++    a = FrameAssembler(123)
++    for p in [b'', packets(b'\xff\xd8ok\xff\xd9', token=9)[0],
++              HEADER.pack(b'EVF1', 123, 1, 999999, 0, 834),
++              packets(b'notajpeg')[0], packets(b'\xff\xd8ok\xff\xd9')[0][:-1]]:
++        assert a.feed(p, 0) is None
++
++
++def test_sequence_wrap():
++    a = FrameAssembler(123)
++    data = b'\xff\xd8ok\xff\xd9'
++    assert a.feed(packets(data, 0xffffffff)[0], 0) == data
++    assert a.feed(packets(data, 0)[0], 0.1) == data
++    assert a.feed(packets(data, 0xffffffff)[0], 0.2) is None
++
++
++def test_real_udp_subscription_decode_and_unsubscribe():
++    server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
++    server.bind(('127.0.0.1', 0))
++    server.settimeout(2)
++    receiver = UdpVideo('127.0.0.1', server.getsockname()[1])
++    try:
++        request, peer = server.recvfrom(32)
++        magic, token = struct.unpack('!4sI', request)
++        assert magic == b'EVS1'
++        ok, jpeg = cv.imencode('.jpg', np.zeros((60, 80, 3), np.uint8))
++        assert ok
++        for packet in reversed(packets(jpeg.tobytes(), token=token)):
++            server.sendto(packet, peer)
++        deadline = time.monotonic() + 2
++        frame, age = receiver.latest()
++        while frame is None and time.monotonic() < deadline:
++            time.sleep(0.01)
++            frame, age = receiver.latest()
++        assert frame.shape == (60, 80, 3)
++        assert age < 0.5
++    finally:
++        receiver.close()
++    try:
++        while True:
++            request, _ = server.recvfrom(32)
++            if request[:4] == b'EVX1':
++                assert request[4:] == struct.pack('!I', token)
++                break
++    finally:
++        server.close()
+diff --git a/tests/unit_tests/test_gamepad.py b/tests/unit_tests/test_gamepad.py
+new file mode 100644
+index 0000000..b1fcca0
+--- /dev/null
++++ b/tests/unit_tests/test_gamepad.py
+@@ -0,0 +1,93 @@
++from unittest.mock import MagicMock
++import pygame as pg
++import pytest
++from elegoo_robot_car4.elegoo_smartcar_control import GameEngine
++
++
++def pad(axes=None, buttons=()):
++    result = MagicMock()
++    result.attached.return_value = True
++    result.get_axis.side_effect = lambda axis: (axes or {}).get(axis, 0)
++    result.get_button.side_effect = lambda button: button in buttons
++    return result
++
++
++def engine(*pads):
++    result = GameEngine.__new__(GameEngine)
++    result._GameEngine__car = MagicMock()
++    result._GameEngine__joysticks = dict(enumerate(pads))
++    result._GameEngine__delta_speed = 150
++    return result
++
++
++@pytest.mark.parametrize('x,y,action', [
++    (0,-32768,'forward'), (0,32767,'backward'),
++    (-32768,0,'left'), (32767,0,'right'),
++    (-32768,-32768,'forward_left'), (32767,-32768,'forward_right'),
++    (-32768,32767,'backward_left'), (32767,32767,'backward_right')])
++def test_stick_directions(x,y,action):
++    e=engine(pad({pg.CONTROLLER_AXIS_LEFTX:x,pg.CONTROLLER_AXIS_LEFTY:y}))
++    assert e._GameEngine__handle_controller_player_actions()
++    getattr(e._GameEngine__car,action).assert_called_once_with(speed=50,lazy=True)
++
++
++def test_neutral_and_deadzone_return_no_drive():
++    e=engine(pad({pg.CONTROLLER_AXIS_LEFTX:4000,pg.CONTROLLER_AXIS_LEFTY:-1000}))
++    assert not e._GameEngine__handle_controller_player_actions()
++    assert not e._GameEngine__car.mock_calls
++
++
++def test_trigger_and_stick_scale_speed():
++    p=pad({pg.CONTROLLER_AXIS_LEFTY:-32768,pg.CONTROLLER_AXIS_TRIGGERRIGHT:32767})
++    e=engine(p)
++    e._GameEngine__handle_controller_player_actions()
++    e._GameEngine__car.forward.assert_called_once_with(speed=200,lazy=True)
++    e=engine(pad({pg.CONTROLLER_AXIS_LEFTY:-19661,pg.CONTROLLER_AXIS_TRIGGERRIGHT:32767}))
++    e._GameEngine__handle_controller_player_actions()
++    e._GameEngine__car.forward.assert_called_once_with(speed=125,lazy=True)
++
++
++def test_idle_pad_does_not_hide_active_pad():
++    e=engine(pad(),pad(buttons=[pg.CONTROLLER_BUTTON_DPAD_UP]))
++    assert e._GameEngine__handle_controller_player_actions()
++    e._GameEngine__car.forward.assert_called_once_with(speed=50,lazy=True)
++
++
++def test_pan_stops_previous_drive_before_queuing_head_command():
++    e=engine(pad({pg.CONTROLLER_AXIS_RIGHTX:32767,pg.CONTROLLER_AXIS_LEFTY:-32768}))
++    assert e._GameEngine__handle_controller_player_actions()
++    assert [c[0] for c in e._GameEngine__car.mock_calls] == ['stop','turn_head']
++    e._GameEngine__car.turn_head.assert_called_once_with(-10,lazy=True)
++
++
++def test_x_centres_camera():
++    e=engine(pad(buttons=[pg.CONTROLLER_BUTTON_X]))
++    e._GameEngine__handle_controller_player_actions()
++    e._GameEngine__car.stop.assert_called_once()
++    e._GameEngine__car.set_head_angle.assert_called_once_with(lazy=True)
++
++
++def test_hotplug_processed_while_raised(mocker):
++    e=engine()
++    p=pad()
++    p.as_joystick.return_value.get_instance_id.return_value=42
++    mocker.patch('elegoo_robot_car4.elegoo_smartcar_control.gamecontroller.is_controller',return_value=True)
++    mocker.patch('elegoo_robot_car4.elegoo_smartcar_control.gamecontroller.Controller',return_value=p)
++    e._GameEngine__dry_run=False
++    e._GameEngine__car.is_far_from_the_ground.return_value=True
++    mocker.patch.object(e,'_GameEngine__display_new_frame')
++    mocker.patch('pygame.time.Clock')
++    mocker.patch('pygame.display.set_caption')
++    mocker.patch('pygame.event.get',side_effect=[
++        [pg.event.Event(pg.JOYDEVICEADDED,device_index=0)], [pg.event.Event(pg.QUIT)]])
++    e.run()
++    assert e._GameEngine__joysticks[42] is p
++    e._GameEngine__car.move.assert_not_called()
++
++
++def test_disconnect_and_unknown_disconnect_are_safe():
++    p=pad();e=engine(p)
++    e._GameEngine__detect_relevant_events([pg.event.Event(pg.JOYDEVICEREMOVED,instance_id=0),
++                                        pg.event.Event(pg.JOYDEVICEREMOVED,instance_id=999)])
++    assert not e._GameEngine__handle_controller_player_actions()
++    p.quit.assert_called_once()
+diff --git a/tests/unit_tests/test_analogue_drive.py b/tests/unit_tests/test_analogue_drive.py
+new file mode 100644
+index 0000000..fa46928
+--- /dev/null
++++ b/tests/unit_tests/test_analogue_drive.py
+@@ -0,0 +1,325 @@
++import json
++from unittest.mock import MagicMock
++
++import pygame as pg
++import pytest
++
++from elegoo_robot_car4.analogue_drive import AnalogueDrive, deadzone, expo, mix_wheels, motor_pwm
++from elegoo_robot_car4 import Car
++from elegoo_robot_car4.elegoo_smartcar_control import GameEngine
++
++
++@pytest.mark.parametrize('forward,reverse,steering', [(1,.1,1),(.1,1,-1),(1,1,0),(.041,.041,.5)])
++def test_both_triggers_stop_even_with_steering(forward,reverse,steering):
++    drive=AnalogueDrive(left=200,right=100)
++    assert drive.update(forward,reverse,steering,0,10)[:2] == (0,0)
++
++
++def test_noise_is_not_a_second_trigger_press():
++    assert mix_wheels(1,.02,0) == (1,1)
++    assert mix_wheels(.02,1,0) == (-1,-1)
++
++
++def test_full_throttle_turn_keeps_outside_at_limit_and_slows_inside():
++    left,right=mix_wheels(1,0,.5)
++    assert left == 1 and 0 < right < left
++    steer=deadzone(.5,.08)
++    steer=.20+.80*steer**3
++    assert right == pytest.approx((1-steer)/(1+steer))
++
++
++def test_lower_throttle_can_speed_up_outside_wheels():
++    straight=mix_wheels(.4,0,0)
++    left,right=mix_wheels(.4,0,.2)
++    assert 0 < right < straight[0] < left < 1
++
++
++def test_reverse_steering_and_pivot_are_continuous():
++    # Stick-right means nose-right both forwards and backwards (robot convention).
++    left,right=mix_wheels(0,1,.4)
++    assert -1 == right < left < 0
++    left,right=mix_wheels(0,0,.4)
++    assert 0 < left < 1 and right == -left
++    assert mix_wheels(0,0,.079) == (0,0)
++    assert max(map(abs,mix_wheels(0,0,.081))) < .001
++
++
++def test_commands_stay_bounded_and_turn_monotonically():
++    for throttle in [0,.1,.5,1]:
++        previous=-3
++        for i in range(-100,101):
++            left,right=mix_wheels(throttle,0,i/100)
++            assert max(abs(left),abs(right)) <= 1
++            assert left-right >= previous-1e-9
++            previous=left-right
++
++
++def test_release_stop_bypasses_ramp():
++    drive=AnalogueDrive(left=200,right=200)
++    assert drive.update(0,0,0,0,0) == (0,0,0)
++
++
++def test_acceleration_and_camera_rate_are_time_based():
++    a=AnalogueDrive(previous_time=0)
++    b=AnalogueDrive(previous_time=0)
++    for i in range(1,7):
++        a.update(1,0,0,1,i/30)
++    for i in range(1,13):
++        b.update(1,0,0,1,i/60)
++    assert a.left == pytest.approx(b.left)
++    assert a.left == pytest.approx(160)
++    assert a.head == b.head == -80
++    for i in range(7,13):
++        a.update(1,0,0,0,i/30)
++    assert a.head == 0 and a.left == 200
++
++
++def test_long_pause_cannot_create_single_step_acceleration():
++    a=AnalogueDrive(previous_time=0)
++    assert a.update(1,0,0,0,10)[0] == 80
++
++
++def test_camera_does_not_cancel_wheel_commands():
++    a=AnalogueDrive(left=200,right=200,previous_time=0)
++    left,right,head=a.update(1,0,0,1,.1)
++    assert (left,right,head) == (200,200,-45)
++
++
++def test_protocol_requires_handshake_and_sends_signed_wheels_and_exact_pan(car_mocks):
++    sock=car_mocks['socket']
++    sock.recv.side_effect=[b'{drive_v1}',b'{d1_ok}',b'{d2_ok}']
++    with Car() as car:
++        with pytest.raises(RuntimeError,match='handshake'):
++            car.drive_analogue(0,0,0)
++        assert not sock.sendall.called
++        car.enable_analogue_drive()
++        car.drive_analogue(-200,123,17)
++        assert json.loads(sock.sendall.call_args.args[0]) == {
++            'H':'d1','N':1001,'D1':-200,'D2':123,'D3':107}
++        assert car.head_angle == 17
++        car.drive_analogue(-200,123,17)  # identical commands renew the lease
++        assert json.loads(sock.sendall.call_args.args[0])['H'] == 'd2'
++        assert len(sock.sendall.call_args.args[0]) < 64
++        with pytest.raises(ValueError):
++            car.drive_analogue(201,0,0)
++
++
++def test_unsupported_firmware_cannot_enable_fast_drive(car_mocks):
++    car_mocks['socket'].recv.side_effect=TimeoutError()
++    with Car() as car:
++        with pytest.raises(RuntimeError,match='paired'):
++            car.enable_analogue_drive()
++        with pytest.raises(RuntimeError,match='handshake'):
++            car.drive_analogue(100,100,0)
++
++
++def analogue_engine(mocker,axes):
++    engine=GameEngine.__new__(GameEngine)
++    engine._GameEngine__analogue=AnalogueDrive()
++    engine._GameEngine__car=MagicMock()
++    pad=MagicMock()
++    pad.attached.return_value=True
++    pad.get_button.return_value=False
++    pad.get_axis.side_effect=lambda axis: axes.get(axis,0)
++    engine._GameEngine__joysticks={1:pad}
++    mocker.patch('pygame.key.get_focused',return_value=True)
++    return engine
++
++
++def test_new_layout_ignores_left_stick_vertical(mocker):
++    e=analogue_engine(mocker,{pg.CONTROLLER_AXIS_LEFTY:-32768})
++    e._GameEngine__handle_analogue_actions()
++    e._GameEngine__car.drive_analogue.assert_called_once_with(0,0,0)
++
++
++def test_trigger_stop_wins_over_steering_in_actual_handler(mocker):
++    e=analogue_engine(mocker,{pg.CONTROLLER_AXIS_TRIGGERRIGHT:32767,
++                             pg.CONTROLLER_AXIS_TRIGGERLEFT:10000,
++                             pg.CONTROLLER_AXIS_LEFTX:32767})
++    e._GameEngine__analogue.left=200
++    e._GameEngine__handle_analogue_actions()
++    e._GameEngine__car.drive_analogue.assert_called_once_with(0,0,0)
++
++
++def test_focus_loss_stops_and_resets_ramp(mocker):
++    e=analogue_engine(mocker,{pg.CONTROLLER_AXIS_TRIGGERRIGHT:32767})
++    mocker.patch('pygame.key.get_focused',return_value=False)
++    e._GameEngine__analogue.left=200
++    e._GameEngine__handle_analogue_actions()
++    e._GameEngine__car.stop.assert_called_once()
++    e._GameEngine__car.drive_analogue.assert_not_called()
++    assert e._GameEngine__analogue.left == 0
++
++
++def test_drive_error_requests_stop_and_resets_state(mocker):
++    e=analogue_engine(mocker,{pg.CONTROLLER_AXIS_TRIGGERRIGHT:32767})
++    e._GameEngine__car.drive_analogue.side_effect=TimeoutError()
++    with pytest.raises(TimeoutError):
++        e._GameEngine__handle_analogue_actions()
++    e._GameEngine__car.stop.assert_called_once()
++    assert e._GameEngine__analogue.left == 0
++
++
++def test_analogue_loop_never_falls_through_to_legacy_keyboard_or_queue(mocker):
++    e=analogue_engine(mocker,{pg.CONTROLLER_AXIS_TRIGGERRIGHT:32767,
++                             pg.CONTROLLER_AXIS_TRIGGERLEFT:32767,
++                             pg.CONTROLLER_AXIS_LEFTX:32767})
++    e._GameEngine__dry_run=False
++    e._GameEngine__car.is_far_from_the_ground.return_value=False
++    mocker.patch.object(e,'_GameEngine__display_new_frame',return_value=True)
++    old_keyboard=mocker.patch.object(e,'_GameEngine__handle_keyboard_player_actions')
++    mocker.patch('pygame.time.Clock')
++    mocker.patch('pygame.display.set_caption')
++    mocker.patch('pygame.event.get',side_effect=[[],[pg.event.Event(pg.QUIT)]])
++    e.run()
++    old_keyboard.assert_not_called()
++    e._GameEngine__car.move.assert_not_called()
++    e._GameEngine__car.drive_analogue.assert_called_once_with(0,0,0)
++
++
++def test_corrupt_bytes_are_rejected_not_removed_to_forge_an_ack(car_mocks):
++    from elegoo_robot_car4.car import ControlProtocolError
++    sock=car_mocks['socket']
++    sock.recv.side_effect=[b'{drive_v1}', b'{d1_o\xffk}', b'{d2_ok}']
++    with Car() as car:
++        car.enable_analogue_drive()
++        with pytest.raises(ControlProtocolError,match='ff'):
++            car.drive_analogue(10,10,0)
++        car.drive_analogue(0,0,0)
++        assert json.loads(sock.sendall.call_args.args[0])['H']=='d2'
++
++
++def test_split_ascii_ack_still_works(car_mocks):
++    sock=car_mocks['socket']
++    sock.recv.side_effect=[b'{drive_v2_38400}',b'{d1_',b'ok}']
++    with Car() as car:
++        car.enable_analogue_drive()
++        car.drive_analogue(0,0,0)
++        assert car._Car__serial_baud == 38400
++
++
++def test_error_latch_sends_only_zero_until_released_and_acknowledged(mocker):
++    axes={pg.CONTROLLER_AXIS_TRIGGERRIGHT:32767}
++    e=analogue_engine(mocker,axes)
++    e._GameEngine__neutral_required=True
++    e._GameEngine__analogue.left=200
++    mocker.patch('pygame.display.set_caption')
++    e._GameEngine__handle_analogue_actions()
++    e._GameEngine__car.drive_analogue.assert_called_with(0,0,0)
++    assert e._GameEngine__neutral_required
++    axes.clear()
++    e._GameEngine__car.drive_analogue.side_effect=TimeoutError()
++    with pytest.raises(TimeoutError):
++        e._GameEngine__handle_analogue_actions()
++    assert e._GameEngine__neutral_required
++    e._GameEngine__car.stop.assert_called_once()
++    e._GameEngine__car.drive_analogue.side_effect=None
++    e._GameEngine__handle_analogue_actions()
++    assert not e._GameEngine__neutral_required
++
++
++def test_corrupt_drive_reply_does_not_crash_loop_or_replay_throttle(mocker):
++    from elegoo_robot_car4.car import ControlProtocolError
++    e=analogue_engine(mocker,{pg.CONTROLLER_AXIS_TRIGGERRIGHT:32767})
++    e._GameEngine__dry_run=False
++    e._GameEngine__car.is_far_from_the_ground.return_value=False
++    e._GameEngine__car.drive_analogue.side_effect=[ControlProtocolError('bad bytes'),None]
++    mocker.patch.object(e,'_GameEngine__display_new_frame',return_value=True)
++    mocker.patch('pygame.time.Clock')
++    mocker.patch('pygame.display.set_caption')
++    mocker.patch('pygame.event.get',side_effect=[[],[],[pg.event.Event(pg.QUIT)]])
++    e.run()
++    assert e._GameEngine__neutral_required
++    assert e._GameEngine__car.drive_analogue.call_args_list[-1].args==(0,0,0)
++    e._GameEngine__car.stop.assert_called_once()
++
++
++@pytest.mark.parametrize('travel,expected',[(0,0),(.25,.015625),(.5,.125),(.75,.421875),(1,1)])
++def test_expo_gives_fine_control_and_preserves_endpoints(travel,expected):
++    forward=.04+.96*travel
++    assert mix_wheels(forward,0,0)==pytest.approx((expected,expected))
++    assert mix_wheels(0,forward,0)==pytest.approx((-expected,-expected))
++    steering=.08+.92*travel
++    assert mix_wheels(0,0,steering)==pytest.approx((expected,-expected))
++    assert expo(-travel)==pytest.approx(-expected)
++
++
++def test_idle_camera_noise_cannot_change_commanded_angle():
++    drive=AnalogueDrive()
++    for i in range(300):
++        noise=[-.079,.02,0,.079][i%4]
++        assert drive.update(0,0,0,noise,i/30)[2]==0
++
++
++@pytest.mark.parametrize('sign', [-1, 1])
++def test_motor_floor_preserves_zero_direction_and_full_output(sign):
++    assert motor_pwm(0) == 0
++    assert motor_pwm(sign*1e-9) == pytest.approx(sign*30, abs=1e-6)
++    assert motor_pwm(sign) == sign*200
++    assert motor_pwm(sign*.125) == pytest.approx(sign*(30+170*.125))
++
++
++def test_small_inputs_start_above_floor_and_neutral_stops():
++    drive=AnalogueDrive(previous_time=-.1)
++    assert drive.update(.041,0,0,0,0)[:2] == (30,30)
++    assert drive.update(0,0,0,0,.1)[:2] == (0,0)
++    assert drive.update(0,.041,0,0,.2)[:2] == (-30,-30)
++    assert drive.update(.1,.1,1,0,.3)[:2] == (0,0)
++    assert drive.update(0,0,.081,0,.4)[:2] == (30,-30)
++
++
++def test_motor_floor_keeps_cancelled_inside_wheel_stopped():
++    # Full throttle and steering cancel the inside wheel exactly.
++    left,right=mix_wheels(1,0,1)
++    assert motor_pwm(left)>30
++    assert motor_pwm(right)==0
++
++
++def test_camera_trace_reports_changes_and_periodic_unchanged_target(mocker,capsys):
++    engine=GameEngine.__new__(GameEngine)
++    engine._GameEngine__trace_camera=True
++    mocker.patch('elegoo_robot_car4.elegoo_smartcar_control.time.monotonic',side_effect=[0,.1,.2,1.2])
++    engine._GameEngine__trace_camera_command(0,0)
++    engine._GameEngine__trace_camera_command(.01,0)
++    engine._GameEngine__trace_camera_command(1,-80)
++    engine._GameEngine__trace_camera_command(1,-80)
++    lines=capsys.readouterr().out.splitlines()
++    assert len(lines)==3
++    assert 'acknowledged_target=90deg' in lines[0]
++    assert 'stick=+1.0000 acknowledged_target=10deg' in lines[1]
++    assert 'acknowledged_target=10deg' in lines[2]
++
++
++def test_camera_trace_is_opt_in(capsys):
++    engine=GameEngine.__new__(GameEngine)
++    engine._GameEngine__trace_camera_command(0,0)
++    assert capsys.readouterr().out==''
++
++
++@pytest.mark.parametrize('reverse', [False, True])
++def test_moving_steering_has_strong_initial_differential(reverse):
++    forward,backward=(0,1) if reverse else (1,0)
++    left,right=mix_wheels(forward,backward,.081)
++    assert motor_pwm(left)-motor_pwm(right)==pytest.approx(170/3,abs=.001)
++    assert max(abs(motor_pwm(left)),abs(motor_pwm(right)))==200
++    assert mix_wheels(forward,backward,-.081)==pytest.approx((right,left))
++    assert mix_wheels(forward,backward,.079)==((-1,-1) if reverse else (1,1))
++
++
++def test_moving_boost_blends_out_at_zero_throttle():
++    pivot=mix_wheels(0,0,.4)
++    assert mix_wheels(.040001,0,.4)==pytest.approx(pivot,abs=1e-12)
++    # At low throttle a small steer still leaves both wheels moving forward.
++    left,right=mix_wheels(.2,0,.081)
++    assert left>right>0
++    # Crossing the end of the throttle blend has no command discontinuity.
++    trigger=.04+.96*(.25**(1/3))
++    assert mix_wheels(trigger-1e-7,0,.2)==pytest.approx(
++        mix_wheels(trigger+1e-7,0,.2),abs=1e-6)
++
++
++def test_moving_steering_boost_obeys_acceleration_limit_and_immediate_stop():
++    drive=AnalogueDrive(left=200,right=200,previous_time=0)
++    left,right,_=drive.update(1,0,.081,0,1/30)
++    assert left==200 and right==173
++    assert drive.update(1,1,1,0,2/30)[:2]==(0,0)

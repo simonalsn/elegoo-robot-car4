@@ -1,0 +1,64 @@
+--- firmware/uno-gamepad/SmartRobotCarV4.0_V1_20230201/ApplicationFunctionSet_xxx0.cpp
++++ firmware/uno-control38400/SmartRobotCarV4.0_V1_20230201/ApplicationFunctionSet_xxx0.cpp
+@@ -119,7 +119,7 @@
+ void ApplicationFunctionSet::ApplicationFunctionSet_Init(void)
+ {
+   bool res_error = true;
+-  Serial.begin(115200);
++  Serial.begin(38400);
+   AppVoltage.DeviceDriverSet_Voltage_Init();
+   AppMotor.DeviceDriverSet_Motor_Init();
+   AppServo.DeviceDriverSet_Servo_Init(90);
+@@ -2065,7 +2065,7 @@
+ #endif
+         break;
+       case 1002: // Read-only capability handshake; never moves motors.
+-        Serial.print(F("{drive_v1}"));
++        Serial.print(F("{drive_v2_38400}"));
+         break;
+       case 1001: // Signed left/right PWM and absolute camera angle, one transaction.
+         if (!doc["D1"].is<int>() || !doc["D2"].is<int>() || !doc["D3"].is<int>()) break;
+--- firmware/camera-gamepad/ESP32_CameraServer_AP_20220120/ESP32_CameraServer_AP_20220120.ino
++++ firmware/camera-control38400/ESP32_CameraServer_AP_20220120/ESP32_CameraServer_AP_20220120.ino
+@@ -43,7 +43,9 @@
+     {
+       if (client.available()) //如果有可读数据
+       {
+-        char c = client.read();             //读取一个字节
++        int value = client.read();
++        if (value < 0) continue;
++        char c = static_cast<char>(value);             //读取一个字节
+         /* Local: do not mirror control traffic to debug UART. */                    //从串口打印
+         if (true == data_begin && c == '{') //接收到开始字符
+         {
+@@ -70,7 +72,9 @@
+       }
+       if (Serial2.available())
+       {
+-        char c = Serial2.read();
++        int value = Serial2.read();
++        if (value < 0) continue;
++        char c = static_cast<char>(value);
+         sendBuff += c;
+         if (c == '}') //接收到结束字符
+         {
+@@ -138,7 +142,9 @@
+   String sendBuff;
+   if (Serial2.available())
+   {
+-    char c = Serial2.read();
++    int value = Serial2.read();
++    if (value < 0) return;
++    char c = static_cast<char>(value);
+     readBuff += c;
+     if (c == '}') //接收到结束字符
+     {
+@@ -197,7 +203,7 @@
+ void setup()
+ {
+   Serial.begin(115200);
+-  Serial2.begin(115200, SERIAL_8N1, RXD2, TXD2);
++  Serial2.begin(38400, SERIAL_8N1, RXD2, TXD2);
+   //http://192.168.4.1/control?var=framesize&val=3
+   //http://192.168.4.1/Test?var=
+   CameraWebServerAP.CameraWebServer_AP_Init();

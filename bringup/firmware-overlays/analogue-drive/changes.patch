@@ -1,0 +1,118 @@
+--- firmware/uno/SmartRobotCarV4.0_V1_20230201/ApplicationFunctionSet_xxx0.cpp
++++ firmware/uno-gamepad/SmartRobotCarV4.0_V1_20230201/ApplicationFunctionSet_xxx0.cpp
+@@ -17,6 +17,7 @@
+ #include <stdio.h>
+ #include <string.h>
+ #include "ApplicationFunctionSet_xxx0.h"
++#include <Servo.h>
+ #include "DeviceDriverSet_xxx0.h"
+ 
+ #include "ArduinoJson-v6.11.1.h" //ArduinoJson
+@@ -39,6 +40,12 @@
+ DeviceDriverSet_Motor AppMotor;
+ DeviceDriverSet_ULTRASONIC AppULTRASONIC;
+ DeviceDriverSet_Servo AppServo;
++// Local signed-wheel drive: explicit lease applies only to the new mode.
++static int16_t manualLeft, manualRight;
++static uint32_t manualUpdated;
++static bool manualActive;
++extern Servo myservo;
++
+ DeviceDriverSet_IRrecv AppIRrecv;
+ /*f(x) int */
+ static boolean
+@@ -112,7 +119,7 @@
+ void ApplicationFunctionSet::ApplicationFunctionSet_Init(void)
+ {
+   bool res_error = true;
+-  Serial.begin(9600);
++  Serial.begin(115200);
+   AppVoltage.DeviceDriverSet_Voltage_Init();
+   AppMotor.DeviceDriverSet_Motor_Init();
+   AppServo.DeviceDriverSet_Servo_Init(90);
+@@ -1319,6 +1326,17 @@
+ }
+ void ApplicationFunctionSet::CMD_MotorControlSpeed_xxx0(void)
+ {
++  if (manualActive && Application_SmartRobotCarxxx0.Functional_Mode == CMD_MotorControl_Speed) {
++    if (uint32_t(millis() - manualUpdated) > 400 || !Car_LeaveTheGround) {
++      manualLeft = manualRight = 0;
++    }
++    AppMotor.DeviceDriverSet_Motor_control(
++      manualRight < 0 ? direction_back : direction_just, abs(manualRight),
++      manualLeft < 0 ? direction_back : direction_just, abs(manualLeft), control_enable);
++    return;
++  }
++  manualActive = false;
++
+   static boolean MotorControl = false;
+   if (Application_SmartRobotCarxxx0.Functional_Mode == CMD_MotorControl_Speed)
+   {
+@@ -1869,6 +1887,7 @@
+ 
+       case 4:                                                                   /*<Command：N 4> */
+         Application_SmartRobotCarxxx0.Functional_Mode = CMD_MotorControl_Speed; /*motor control:Control motor speed mode*/
++        manualActive = false; // legacy N4 must not retain a previous manual lease
+         CMD_is_MotorSpeed_L = doc["D1"];
+         CMD_is_MotorSpeed_R = doc["D2"];
+ #if _is_print
+@@ -2045,6 +2064,20 @@
+         // Serial.print('{' + CommandSerialNumber + "_ok}");
+ #endif
+         break;
++      case 1002: // Read-only capability handshake; never moves motors.
++        Serial.print(F("{drive_v1}"));
++        break;
++      case 1001: // Signed left/right PWM and absolute camera angle, one transaction.
++        if (!doc["D1"].is<int>() || !doc["D2"].is<int>() || !doc["D3"].is<int>()) break;
++        manualLeft = constrain(doc["D1"].as<int>(), -200, 200);
++        manualRight = constrain(doc["D2"].as<int>(), -200, 200);
++        if (!myservo.attached()) myservo.attach(PIN_Servo_z);
++        myservo.write(constrain(doc["D3"].as<int>(), 10, 170));
++        manualUpdated = millis();
++        manualActive = true;
++        Application_SmartRobotCarxxx0.Functional_Mode = CMD_MotorControl_Speed;
++        Serial.print('{' + CommandSerialNumber + "_ok}");
++        break;
+       case 1000:  // MDS: New code for requesting MPU data
+         CMD_GetMPUData();
+         break;
+--- firmware/camera-router/ESP32_CameraServer_AP_20220120/ESP32_CameraServer_AP_20220120.ino
++++ firmware/camera-gamepad/ESP32_CameraServer_AP_20220120/ESP32_CameraServer_AP_20220120.ino
+@@ -30,6 +30,7 @@
+   WiFiClient client = server.available(); //尝试建立客户对象
+   if (client)                             //如果当前客户可用
+   {
++    client.setNoDelay(true);
+     WA_en = true;
+     ED_client = true;
+     Serial.println("[Client connected]");
+@@ -43,7 +44,7 @@
+       if (client.available()) //如果有可读数据
+       {
+         char c = client.read();             //读取一个字节
+-        Serial.print(c);                    //从串口打印
++        /* Local: do not mirror control traffic to debug UART. */                    //从串口打印
+         if (true == data_begin && c == '{') //接收到开始字符
+         {
+           data_begin = false;
+@@ -74,7 +75,7 @@
+         if (c == '}') //接收到结束字符
+         {
+           client.print(sendBuff);
+-          Serial.print(sendBuff); //从串口打印
++          /* Local: no debug echo of replies. */ //从串口打印
+           sendBuff = "";
+         }
+       }
+@@ -195,8 +196,8 @@
+ }
+ void setup()
+ {
+-  Serial.begin(9600);
+-  Serial2.begin(9600, SERIAL_8N1, RXD2, TXD2);
++  Serial.begin(115200);
++  Serial2.begin(115200, SERIAL_8N1, RXD2, TXD2);
+   //http://192.168.4.1/control?var=framesize&val=3
+   //http://192.168.4.1/Test?var=
+   CameraWebServerAP.CameraWebServer_AP_Init();

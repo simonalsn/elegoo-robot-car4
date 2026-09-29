@@ -2,6 +2,7 @@
 import json
 import re
 import socket
+import time
 from collections import deque
 from collections.abc import Callable
 from contextlib import AbstractContextManager, suppress
@@ -13,6 +14,10 @@ import scipy.integrate
 from ultralytics import YOLO
 from ultralytics.engine.model import Model
 from ultralytics.engine.results import Results
+
+
+class ControlProtocolError(OSError):
+    """A control reply was corrupted; its acknowledgement cannot be trusted."""
 
 
 class Car(AbstractContextManager):
@@ -100,6 +105,10 @@ class Car(AbstractContextManager):
         self.__dry_run = dry_run
         self.__cmd_queue = deque()
         self.__recv_msg_queue = ""
+        self.__command_ready_at = 0.0
+        self.__serial_baud = 9600
+        self.__drive_sequence = 0
+        self.__analogue_ready = False
         self.__head_servo_angle = 90
         self.__a_offsets = np.zeros(3)
         self.__g_offsets = np.zeros(3)
@@ -181,9 +190,15 @@ class Car(AbstractContextManager):
         """
         if self.__dry_run:
             return np.array([])
-        r = req.get(self.__capture_endpoint)
-        frame = np.asarray(bytearray(r.content), dtype=np.int8)
-        return cv.imdecode(frame, cv.IMREAD_UNCHANGED)
+        r = req.get(self.__capture_endpoint, timeout=(2, 3))
+        r.raise_for_status()
+        if not (r.content.startswith(b"\xff\xd8") and r.content.endswith(b"\xff\xd9")):
+            raise ValueError("Incomplete camera JPEG")
+        frame = np.frombuffer(r.content, dtype=np.uint8)
+        decoded = cv.imdecode(frame, cv.IMREAD_UNCHANGED)
+        if decoded is None:
+            raise ValueError("Camera JPEG could not be decoded")
+        return decoded
 
     def track(self, frame: np.ndarray, **kwargs) -> list[Results]:
         """
@@ -386,6 +401,29 @@ class Car(AbstractContextManager):
         self.__send_cmd(cmd)
         expected_pattern = f"{{{cmd_id}_ok}}"
         self.__recv_until_confirmation(expected_pattern)
+
+    def enable_analogue_drive(self):
+        """Require the new firmware before sending any signed-wheel commands."""
+        self.__send_cmd({"H": "cap", "N": 1002})
+        try:
+            reply = self.__recv_until_confirmation(r"\{drive_v(?:1|2_38400)\}")
+        except (OSError, ValueError) as exc:
+            raise RuntimeError("Analogue drive requires paired analogue-drive UNO/ESP32 firmware") from exc
+        if not self.__dry_run:
+            self.__socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self.__serial_baud = 38400 if "2_38400" in reply else 115200
+        self.__analogue_ready = True
+
+    def drive_analogue(self, left: int, right: int, head: int):
+        """One acknowledged wheel/pan update; firmware expires it after 400 ms."""
+        if not self.__analogue_ready:
+            raise RuntimeError("Analogue drive firmware handshake has not succeeded")
+        if not (-200 <= left <= 200 and -200 <= right <= 200 and -80 <= head <= 80):
+            raise ValueError("Wheel or camera command outside supported range")
+        self.__drive_sequence = (self.__drive_sequence + 1) & 0xffff
+        self.__process_cmd({"H": f"d{self.__drive_sequence}", "N": 1001,
+                            "D1": int(left), "D2": int(right), "D3": int(head)+90}, False)
+        self.__head_servo_angle = int(head)+90
 
     def forward(self, speed: int = 50, lazy: bool = False) -> None:
         """
@@ -745,9 +783,14 @@ class Car(AbstractContextManager):
         self.__state = new_state
 
     def __send_cmd(self, cmd_data: dict) -> None:
-        json_cmd = json.dumps(cmd_data).encode()
+        json_cmd = (json.dumps(cmd_data, separators=(",", ":")) if self.__analogue_ready
+                    else json.dumps(cmd_data)).encode()
         if not self.__dry_run:
+            # Use the negotiated UART speed; legacy firmware remains at 9600.
+            # In particular, leave room after commands with no response.
+            time.sleep(max(0.0, self.__command_ready_at - time.monotonic()))
             self.__socket.sendall(json_cmd)
+            self.__command_ready_at = time.monotonic() + len(json_cmd) * 10 / self.__serial_baud + (0.002 if self.__analogue_ready else 0.03)
         if self.log:  # pragma: no cover
             print(f"Sent command: {json_cmd}")
 
@@ -756,8 +799,30 @@ class Car(AbstractContextManager):
             return ""
         pattern = re.compile(expected_confirmation)
         m = pattern.search(self.__recv_msg_queue)
+        deadline = time.monotonic() + 2.0
         while not m:
-            self.__recv_msg_queue += self.__socket.recv(4096).decode()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Robot command response timed out")
+            self.__socket.settimeout(remaining)
+            try:
+                received = self.__socket.recv(4096)
+            finally:
+                self.__socket.settimeout(2)
+            if not received:
+                raise ConnectionError("Robot closed the control connection")
+            try:
+                decoded = received.decode("ascii")
+                if any(ord(c) < 32 and c not in "\r\n\t" for c in decoded):
+                    raise ValueError("non-text control bytes")
+            except (UnicodeDecodeError, ValueError) as exc:
+                self.__recv_msg_queue = ""
+                raise ControlProtocolError(
+                    f"Corrupt serial control reply (hex: {received[:96].hex()})") from exc
+            self.__recv_msg_queue += decoded
+            if len(self.__recv_msg_queue) > 16384:
+                self.__recv_msg_queue = ""
+                raise ControlProtocolError("Control reply buffer exceeded its limit")
             # Remove all received {Heartbeat} messages
             self.__recv_msg_queue = self.__heartbeat_re.sub(
                 "", self.__recv_msg_queue

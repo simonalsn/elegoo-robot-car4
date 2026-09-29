@@ -1,3 +1,9 @@
+> **Local development checkpoint:** UDP video, analogue gamepad driving,
+> control-link recovery and servo fixes are documented in
+> [bring-up workspace notes](bringup/WORKSPACE.md). The dashboard mockup is in
+> [bringup/docs/dashboard-mockup](bringup/docs/dashboard-mockup/README.md).
+> These additions extend the upstream project described below.
+
 # Software suite for the ELEGOO Smart Robot Car Kit V4.0 🤖🚗
 
 This is my personal software suite for the **ELEGOO Smart Robot Car Kit V4.0**.

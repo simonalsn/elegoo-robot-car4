@@ -1,0 +1,224 @@
+{
+  "uno_patched": {
+    "path": ".cache/build/uno-patched/SmartRobotCarV4.0_V1_20230201.ino.hex",
+    "sha256": "87f6db728b9bbecc28e19fe0726d75e0a238c6337ef60753335093fe223c1f6c",
+    "program_bytes": 31830,
+    "end_exclusive": "0x7c56",
+    "upload_status": "uploaded and AVRDUDE verified 31830 bytes; USB sensor checks passed"
+  },
+  "camera_router": {
+    "path": ".cache/build/camera-router/ESP32_CameraServer_AP_20220120.ino.bin",
+    "sha256": "f0e3f98dbe4da41bbb0b05112acc342753da1fb8f5d86c15907e7eb37b60d190",
+    "image_bytes": 2609184,
+    "offset": "0x10000",
+    "upload_status": "uploaded; esptool verified flash hash",
+    "ip": "192.168.0.213",
+    "network_checks": "capture HTTP 200, three MJPEG stream frames, TCP 100 heartbeat"
+  },
+  "camera_udp": {
+    "path": ".cache/build/camera-udp/ESP32_CameraServer_AP_20220120.ino.bin",
+    "sha256": "1e0a2371d2890524ecf7f1d2e49d96f81fca68e472bb58f9a21572f183e14c8b",
+    "image_bytes": 2612800,
+    "offset": "0x10000",
+    "upload_status": "uploaded at 0x10000; esptool flash hash verified; reset into application",
+    "partition_table": "identical to known-working router firmware",
+    "ip": "192.168.0.213",
+    "network_checks": "178 decoded 800x600 UDP frames in 15.02 seconds; lease expiry, restart, unsubscribe and HTTP capture fallback passed"
+  },
+  "uno_analogue": {
+    "path": ".cache/build/uno-gamepad/SmartRobotCarV4.0_V1_20230201.ino.hex",
+    "sha256": "e67cbf629a09ce15ed7d3a0cb9a31fd0e9c4f2b0fd13b7fde3933de1effc3ac0",
+    "program_bytes": 31894,
+    "global_ram_bytes": 1227,
+    "serial_baud": 115200,
+    "upload_status": "uploaded; AVRDUDE verified 31894 bytes",
+    "compiler_extra_flags": "-mcall-prologues (C, C++, link)",
+    "validation": "512 bootloader bytes preserved; 150 zero-speed USB updates and sensors passed at 115200; mean ack 6.8ms, max 8.2ms",
+    "paired_validation_log": "logs/analogue-drive-2026-09-29/wifi-probe.json"
+  },
+  "camera_analogue": {
+    "path": ".cache/build/camera-gamepad/ESP32_CameraServer_AP_20220120.ino.bin",
+    "sha256": "abf9a0bc43da58f63924562a907589436a5709c79a504827cc4db7e42eff4375",
+    "image_bytes": 2612848,
+    "offset": "0x10000",
+    "serial_baud": 115200,
+    "upload_status": "uploaded at 0x10000; esptool hash verified; reset into app",
+    "partition_table": "identical to working UDP firmware",
+    "camera_checks": "isolated ESP32: 95 decoded 800x600 UDP frames in 8.01 seconds; no errors",
+    "paired_validation": {
+      "passed": true,
+      "zero_speed_updates": 300,
+      "elapsed_seconds": 10.432372070965357,
+      "mean_ack_ms": 19.047499786441524,
+      "max_ack_ms": 243.2152659748681,
+      "udp_frames": 119,
+      "frame_shape": [
+        600,
+        800,
+        3
+      ],
+      "latest_receive_age_seconds": 0.06742241099709645,
+      "mpu": {
+        "id": "MPU_Request_1232880559",
+        "t": 40.547000000000004,
+        "a": [
+          0.013427734375,
+          -0.0078125,
+          -0.998046875
+        ],
+        "g": [
+          -0.946044921875,
+          0.60272216796875,
+          -0.885009765625
+        ]
+      },
+      "movement_tested": false
+    }
+  },
+  "uno_control38400": {
+    "path": ".cache/build/uno-control38400/SmartRobotCarV4.0_V1_20230201.ino.hex",
+    "sha256": "b3d0c64d5a619c76701af0580e77b6d5f11baa3aebc88dce0a2a8b4d697cfec1",
+    "serial_baud": 38400,
+    "upload_status": "uploaded; AVRDUDE verified 31900 bytes; original 512-byte bootloader preserved",
+    "validation": {
+      "passed": true,
+      "baud": 38400,
+      "zero_speed_updates": 150,
+      "mean_ack_ms": 16.090943587090198,
+      "max_ack_ms": 20.059084985405207,
+      "ground": "{ground_true}",
+      "mpu": {
+        "id": "mpu",
+        "t": 6688,
+        "a": [
+          84,
+          -240,
+          16500
+        ],
+        "g": [
+          -107,
+          114,
+          -114
+        ]
+      },
+      "movement_tested": false
+    },
+    "paired_validation_log": "logs/control-recovery-2026-09-29/wifi-probe.json"
+  },
+  "camera_control38400": {
+    "path": ".cache/build/camera-control38400/ESP32_CameraServer_AP_20220120.ino.bin",
+    "sha256": "bd96d9d0a15c8516e4f8ac6448b6fa7b61d45278b8e3c8610336d05c15744ee6",
+    "serial_baud": 38400,
+    "upload_status": "uploaded at 0x10000; esptool hash verified; reset into application",
+    "image_bytes": 2612864,
+    "offset": "0x10000",
+    "partition_table": "identical to previous analogue/UDP application",
+    "camera_validation": {
+      "frames": 96,
+      "elapsed_seconds": 8.00889441196341,
+      "latest_frame_age_seconds": 0.07030810200376436,
+      "shape": [
+        600,
+        800,
+        3
+      ],
+      "error": null
+    },
+    "paired_validation": {
+      "passed": true,
+      "zero_speed_updates": 1800,
+      "elapsed_seconds": 65.35989451000933,
+      "mean_ack_ms": 27.11743513067227,
+      "max_ack_ms": 263.09648604365066,
+      "udp_frames": 780,
+      "frame_shape": [
+        600,
+        800,
+        3
+      ],
+      "latest_receive_age_seconds": 0.04751237900927663,
+      "mpu": {
+        "id": "MPU_Request_151708289",
+        "t": 90.436,
+        "a": [
+          0.0,
+          -0.042236328125,
+          -1.006591796875
+        ],
+        "g": [
+          -0.823974609375,
+          0.60272216796875,
+          -1.1138916015625
+        ]
+      },
+      "movement_tested": false
+    }
+  },
+  "uno_servo_idle": {
+    "path": ".cache/build/uno-servo-idle/SmartRobotCarV4.0_V1_20230201.ino.hex",
+    "sha256": "6c3b32eaf9cdb3e4e797e4a3f8d2b42dbe3c0436858e663510f56354b8b2b0e3",
+    "program_bytes": 32084,
+    "global_ram_bytes": 1231,
+    "serial_baud": 38400,
+    "upload_status": "uploaded; 32084 flash bytes verified by avrdude; original 512-byte bootloader preserved",
+    "purpose": "release servo after 500ms at unchanged target; reattach only for changed target or mode entry",
+    "usb_validation": {
+      "passed": true,
+      "baud": 38400,
+      "zero_speed_updates": 150,
+      "mean_ack_ms": 15.993458793964237,
+      "max_ack_ms": 18.315349996555597,
+      "ground": "{ground_true}",
+      "mpu": {
+        "id": "mpu",
+        "t": 6689,
+        "a": [
+          120,
+          -72,
+          16456
+        ],
+        "g": [
+          -135,
+          123,
+          -119
+        ]
+      },
+      "movement_tested": false
+    },
+    "physical_idle_validation": "User reports periodic twitch stopped, but occasional full rightward turn also after sitting still; investigation continues"
+  },
+  "uno_servo_pulse_safe": {
+    "path": ".cache/build/uno-servo-pulse-safe/SmartRobotCarV4.0_V1_20230201.ino.hex",
+    "sha256": "5ca024e47495ccd1c1b92169eff2716824ba59f97344bc01cb315944d41c704d",
+    "program_bytes": 32130,
+    "global_ram_bytes": 1231,
+    "serial_baud": 38400,
+    "upload_status": "uploaded; 32130 flash bytes verified; original 512-byte bootloader preserved",
+    "purpose": "detach only while servo signal is LOW with interrupts masked; preserve complete pulses",
+    "host_validation": "tools/test-servo-pulse-safe.py passed; physical validation pending",
+    "usb_validation": {
+      "passed": true,
+      "baud": 38400,
+      "zero_speed_updates": 150,
+      "mean_ack_ms": 16.02823030669242,
+      "max_ack_ms": 17.902717052493244,
+      "ground": "{ground_true}",
+      "mpu": {
+        "id": "mpu",
+        "t": 6684,
+        "a": [
+          264,
+          36,
+          16468
+        ],
+        "g": [
+          -106,
+          104,
+          -133
+        ]
+      },
+      "movement_tested": false
+    },
+    "physical_validation": "User reports good operation and no camera servo issues after update"
+  }
+}

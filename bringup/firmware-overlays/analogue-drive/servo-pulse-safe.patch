@@ -1,0 +1,55 @@
+--- firmware/uno-servo-idle/SmartRobotCarV4.0_V1_20230201/ApplicationFunctionSet_xxx0.cpp
++++ firmware/uno-servo-pulse-safe/SmartRobotCarV4.0_V1_20230201/ApplicationFunctionSet_xxx0.cpp
+@@ -47,6 +47,19 @@
+ static uint8_t manualPan = 255;
+ static uint32_t manualPanUpdated;
+ extern Servo myservo;
++
++// Check and detach atomically: a Servo ISR must not start a pulse between them.
++// If a pulse is high, leave its falling edge to Servo and retry next loop.
++static bool releaseManualPan()
++{
++  uint8_t savedSREG = SREG;
++  cli();
++  bool released = digitalRead(PIN_Servo_z) == LOW;
++  if (released) myservo.detach();
++  SREG = savedSREG;
++  return released;
++}
++
+ 
+ DeviceDriverSet_IRrecv AppIRrecv;
+ /*f(x) int */
+@@ -1331,8 +1344,7 @@
+   if (manualActive && Application_SmartRobotCarxxx0.Functional_Mode == CMD_MotorControl_Speed) {
+     // Hold through travel/settling, then cease pulses while the target is idle.
+     if (myservo.attached() && uint32_t(millis() - manualPanUpdated) > 500) {
+-      myservo.detach();
+-      digitalWrite(PIN_Servo_z, LOW);
++      releaseManualPan();
+     }
+     if (uint32_t(millis() - manualUpdated) > 400 || !Car_LeaveTheGround) {
+       manualLeft = manualRight = 0;
+@@ -1342,11 +1354,7 @@
+       manualLeft < 0 ? direction_back : direction_just, abs(manualLeft), control_enable);
+     return;
+   }
+-  if (manualActive) {
+-    myservo.detach();
+-    digitalWrite(PIN_Servo_z, LOW);
+-  }
+-  manualActive = false;
++  if (manualActive && releaseManualPan()) manualActive = false;
+ 
+   static boolean MotorControl = false;
+   if (Application_SmartRobotCarxxx0.Functional_Mode == CMD_MotorControl_Speed)
+@@ -2085,8 +2093,8 @@
+         if (!manualActive || manualPan != constrain(doc["D3"].as<int>(), 10, 170)) {
+           manualPan = constrain(doc["D3"].as<int>(), 10, 170);
+           // Repeated motor/lease updates must not reattach an idle servo.
++          myservo.write(manualPan);
+           if (!myservo.attached()) myservo.attach(PIN_Servo_z);
+-          myservo.write(manualPan);
+           manualPanUpdated = millis();
+         }
+         manualUpdated = millis();

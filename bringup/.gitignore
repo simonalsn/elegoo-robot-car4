@@ -1,0 +1,5 @@
+.cache/
+backups/
+stock/
+firmware/
+__pycache__/
