@@ -5,6 +5,7 @@ import json
 import re
 import socket
 import time
+import threading
 from collections import deque
 from collections.abc import Callable
 from contextlib import AbstractContextManager, suppress
@@ -93,6 +94,8 @@ class Car(AbstractContextManager):
         log: bool = False,
         dry_run: bool = False,
         stop_before_init: bool = False,
+        initialize: bool = True,
+        cancel_event: threading.Event | None = None,
     ):
         """
         Initializes the connection with the car.
@@ -108,6 +111,7 @@ class Car(AbstractContextManager):
         self.__state = "stop"
         self.log = log
         self.__dry_run = dry_run
+        self.__cancel_event = cancel_event or threading.Event()
         self.__cmd_queue = deque()
         self.__recv_msg_queue = ""
         self.__command_ready_at = 0.0
@@ -127,10 +131,12 @@ class Car(AbstractContextManager):
             self.__socket.settimeout(2)
             try:
                 self.__socket.connect((ip, port))
+                self.__socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 if stop_before_init:
                     self.stop()
-                self.__compute_mpu_offsets()
-                self.set_head_angle()
+                if initialize:
+                    self.__compute_mpu_offsets()
+                    self.set_head_angle()
             except Exception:
                 self.__socket.close()
                 raise
@@ -190,6 +196,11 @@ class Car(AbstractContextManager):
         """
         with suppress(BaseException):
             self.__socket.close()
+
+    def cancel(self):
+        self.__cancel_event.set()
+        with suppress(OSError, AttributeError):
+            self.__socket.shutdown(socket.SHUT_RDWR)
 
     def capture(self) -> np.ndarray:
         """
@@ -384,7 +395,7 @@ class Car(AbstractContextManager):
             True if the car is far from the ground. False otherwise.
             The result is deduced from the IR sensor readings.
         """
-        cmd_id = f"Leaves_the_ground_{np.random.randint(0, 1 << 32)}"
+        cmd_id = f"g{np.random.randint(0, 1 << 16):04x}"
         cmd = {"H": cmd_id, "N": 23}
         self.__send_cmd(cmd)
         pattern = f"{{{cmd_id}_(true|false)}}"
@@ -425,16 +436,17 @@ class Car(AbstractContextManager):
         self.__serial_baud = 38400 if "2_38400" in reply else 115200
         self.__analogue_ready = True
 
-    def drive_analogue(self, left: int, right: int, head: int):
+    def drive_analogue(self, left: int, right: int, head: int, *, latest=None):
         """One acknowledged wheel/pan update; firmware expires it after 400 ms."""
         if not self.__analogue_ready:
             raise RuntimeError("Analogue drive firmware handshake has not succeeded")
         if not (-200 <= left <= 200 and -200 <= right <= 200 and -80 <= head <= 80):
             raise ValueError("Wheel or camera command outside supported range")
         self.__drive_sequence = (self.__drive_sequence + 1) & 0xffff
-        self.__process_cmd({"H": f"d{self.__drive_sequence}", "N": 1001,
-                            "D1": int(left), "D2": int(right), "D3": int(head)+90}, False)
-        self.__head_servo_angle = int(head)+90
+        command = {"H": f"d{self.__drive_sequence}", "N": 1001,
+                   "D1": int(left), "D2": int(right), "D3": int(head)+90}
+        self.__process_cmd(command, False, latest=latest)
+        self.__head_servo_angle = command['D3']
 
     def forward(self, speed: int = 50, lazy: bool = False) -> None:
         """
@@ -794,13 +806,20 @@ class Car(AbstractContextManager):
             self.__head_servo_angle = state_cmd["D2"]
         self.__state = new_state
 
-    def __send_cmd(self, cmd_data: dict) -> None:
-        json_cmd = (json.dumps(cmd_data, separators=(",", ":")) if self.__analogue_ready
-                    else json.dumps(cmd_data)).encode()
+    def __send_cmd(self, cmd_data: dict, latest=None) -> None:
         if not self.__dry_run:
             # Use the negotiated UART speed; legacy firmware remains at 9600.
             # In particular, leave room after commands with no response.
-            time.sleep(max(0.0, self.__command_ready_at - time.monotonic()))
+            if self.__cancel_event.wait(max(0.0, self.__command_ready_at - time.monotonic())):
+                raise ConnectionAbortedError('Control operation cancelled')
+        if latest is not None:
+            left, right, head = latest()
+            if not (-200 <= left <= 200 and -200 <= right <= 200 and -80 <= head <= 80):
+                raise ValueError('Wheel or camera command outside supported range')
+            cmd_data.update(D1=int(left), D2=int(right), D3=int(head)+90)
+        json_cmd = (json.dumps(cmd_data, separators=(",", ":")) if self.__analogue_ready
+                    else json.dumps(cmd_data)).encode()
+        if not self.__dry_run:
             self.__socket.sendall(json_cmd)
             self.__command_ready_at = time.monotonic() + len(json_cmd) * 10 / self.__serial_baud + (0.002 if self.__analogue_ready else 0.03)
         if self.log:  # pragma: no cover
@@ -813,12 +832,16 @@ class Car(AbstractContextManager):
         m = pattern.search(self.__recv_msg_queue)
         deadline = time.monotonic() + 2.0
         while not m:
+            if self.__cancel_event.is_set():
+                raise ConnectionAbortedError('Control operation cancelled')
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("Robot command response timed out")
-            self.__socket.settimeout(remaining)
+            self.__socket.settimeout(min(remaining, .1))
             try:
                 received = self.__socket.recv(4096)
+            except socket.timeout:
+                continue
             finally:
                 self.__socket.settimeout(2)
             if not received:
@@ -847,11 +870,14 @@ class Car(AbstractContextManager):
         self.__recv_msg_queue = pattern.sub("", self.__recv_msg_queue)
         return m.group(0)
 
-    def __process_cmd(self, cmd: dict, lazy: bool) -> None:
+    def __process_cmd(self, cmd: dict, lazy: bool, latest=None) -> None:
         if lazy:
             self.__cmd_queue += [cmd]
             return
-        self.__send_cmd(cmd)
+        if latest is None:
+            self.__send_cmd(cmd)
+        else:
+            self.__send_cmd(cmd, latest=latest)
         new_state = cmd["H"]
         wait_for_confirmation = new_state not in self.__no_response_cmds
         if wait_for_confirmation:

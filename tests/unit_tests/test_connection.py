@@ -19,6 +19,27 @@ class ImmediateExecutor:
         pass
 
 
+class SteppedConnection(Connection):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.controlling = False
+
+    def start_control(self):
+        self.controlling = True
+
+    def poll(self):
+        if not self.controlling:
+            return super().poll()
+        if self._cancel.is_set():
+            self.controlling = False
+            return True, None
+        try:
+            return True, self.exchange(self.current_demand(), latest=self.current_demand)
+        except Exception as exc:
+            self.controlling = False
+            return False, exc
+
+
 def test_connect_replaces_socket_handshake_video_and_starts_zero():
     first, second = MagicMock(), MagicMock()
     factory = MagicMock(side_effect=[first, second])

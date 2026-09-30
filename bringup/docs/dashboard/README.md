@@ -76,14 +76,18 @@ The dashboard now offers four presets below the video:
 | --- | --- | --- |
 | Fast | 320 x 240 | 20 |
 | Drive | 640 x 480 | 15 |
+| Balanced | 800 x 600 | 10 |
 | Detail | 1024 x 768 | 10 |
-| Max detail | 1600 x 1200 | 10 |
 
 Lower JPEG setting means higher quality/larger frames, not a percentage. Startup
-leaves the camera's existing settings unchanged; no preset is selected implicitly.
+and reconnect apply Balanced automatically. The button turns green after settings
+readback and a fresh 800 x 600 frame confirm the selection; driving stays blocked
+through that transition.
+Balanced reproduces the installed firmware's 800 x 600 / JPEG 10 startup settings.
+Max detail (1600 x 1200) was removed after repeated frame drops in driving use.
 These presets use the HTTP `/control` and `/status` endpoints already present in
 the installed camera firmware. No firmware update is required for this car. Frame
-size IDs are specifically those of Arduino-ESP32 1.0.6 (5, 8, 10, 13); they must
+size IDs are specifically those of Arduino-ESP32 1.0.6 (5, 8, 9, 10); they must
 not be assumed compatible with arbitrary newer firmware.
 
 Selecting a preset requests and confirms Stop before starting the HTTP worker.
@@ -98,8 +102,8 @@ pressed Stop/Space; a preset change preserves any existing manual stop. The post
 If settings fail, the camera may have applied only part of the change. The UI
 reports failure rather than assuming rollback or success. Select a preset again.
 If settings are accepted but no matching fresh frame arrives within eight seconds,
-try Drive or Fast. The existing 256 KiB JPEG limit is unchanged; Max detail at
-quality 10 may exceed it in some scenes. There is no automatic quality fallback.
+try Balanced, Drive or Fast. The existing 256 KiB JPEG limit is unchanged.
+Detail can automatically increase compression; the driving presets keep their quality.
 Settings are runtime-only and the firmware startup defaults return on reboot.
 
 Compare video FPS, receive age and control reply time under similar lighting.
@@ -202,6 +206,12 @@ Ground polling remains at 10 Hz to preserve the serial bandwidth budget.
 Validation: mocked offline/reboot, failed retries, manual reconnect, held trigger,
 manual Stop preservation, socket cleanup, background polling and resized button
 hitboxes. Physical power-cycle validation is still pending.
+
+The later [active-code review fixes](../active-code-review-fixes.md) supersede the
+calibration and scheduling details above: dashboard reconnect now skips IMU offset
+calibration, control refresh is independent of rendering, input expires after
+150 ms, and video age includes assembly/decode time. Detail can adapt
+JPEG quality while preserving resolution and the manual Stop latch.
 
 ### Optional features and default launch (2026-09-30)
 

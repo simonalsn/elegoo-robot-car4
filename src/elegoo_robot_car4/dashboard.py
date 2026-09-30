@@ -1,6 +1,8 @@
 """Pygame driving dashboard. Rendering has no robot or gamepad side effects."""
 from dataclasses import dataclass
 import math
+import os
+from collections import OrderedDict
 import pygame as pg
 from .camera_presets import PRESETS
 
@@ -46,6 +48,10 @@ class Dashboard:
     PRESET_RECTS = {key: pg.Rect(244+i*246, 876, 234, 43) for i, key in enumerate(PRESETS)}
 
     def __init__(self, robot_ip='', transport='udp', preview=False):
+        # Our Surface renderer needs no OpenGL context. SDL's automatic window
+        # acceleration can terminate X11 clients on incompatible GLX drivers.
+        # Keep an explicit user override available for other display setups.
+        os.environ.setdefault('SDL_FRAMEBUFFER_ACCELERATION', '0')
         pg.font.init()
         self.screen = pg.display.set_mode((1200, 960), pg.RESIZABLE)
         self.canvas = pg.Surface(self.SIZE)
@@ -54,6 +60,10 @@ class Dashboard:
         self.frame = None
         self.frame_size = None
         self._scaled_frame = None
+        self._text_cache = OrderedDict()
+        self._scaled_canvas = None
+        self._stale_overlay = pg.Surface((864, 648), pg.SRCALPHA)
+        self._stale_overlay.fill((12, 20, 26, 185))
         self.offset = (0, 0)
         self.scale = 1.0
         self._transform()
@@ -92,7 +102,15 @@ class Dashboard:
         self._scaled_frame = (pg.transform.smoothscale(surface, rect.size), rect)
 
     def text(self, text, x, y, size=18, color=None):
-        self.canvas.blit(self.fonts[size].render(str(text), True, color or self.TEXT), (x, y))
+        key = (str(text), size, tuple(pg.Color(color or self.TEXT)))
+        surface = self._text_cache.get(key)
+        if surface is None:
+            surface = self.fonts[size].render(key[0], True, key[2])
+            self._text_cache[key] = surface
+            if len(self._text_cache) > 256:
+                self._text_cache.popitem(last=False)
+        self._text_cache.move_to_end(key)
+        self.canvas.blit(surface, (x, y))
 
     def wrapped(self, text, x, y, width, size=16, color=None):
         words, line = text.split(), ''
@@ -143,9 +161,7 @@ class Dashboard:
                 pg.draw.line(self.canvas, '#ffffff', (446, 464), (466, 464))
                 pg.draw.line(self.canvas, '#ffffff', (456, 454), (456, 474))
         if state.video_stale:
-            overlay = pg.Surface((864, 648), pg.SRCALPHA)
-            overlay.fill((12, 20, 26, 185))
-            self.canvas.blit(overlay, (24, 140))
+            self.canvas.blit(self._stale_overlay, (24, 140))
             self.text('Waiting for fresh video', 298, 433, 28)
             self.text('Driving is blocked while the image is stale.', 276, 479, 18, self.MUTED)
         else:
@@ -156,7 +172,7 @@ class Dashboard:
         if state.ack_at is not None and now-state.ack_at >= 2:
             ack += ' (old)'
         metrics = [('VIDEO RATE', '--' if state.fps is None else f'{state.fps:.1f} fps'),
-                   ('RECEIVE AGE', age), ('LAST CONTROL REPLY', ack)]
+                   ('RECEIVE AGE', age), ('CONTROL EXCHANGE', ack)]
         for x, (title, value) in zip((42, 325, 608), metrics):
             self.text(title, x, 798, 14, self.MUTED)
             self.text(value, x, 819, 18)
@@ -216,7 +232,10 @@ class Dashboard:
         self._transform()
         size = (round(self.SIZE[0]*self.scale), round(self.SIZE[1]*self.scale))
         self.screen.fill(self.BG)
-        self.screen.blit(pg.transform.smoothscale(self.canvas, size), self.offset)
+        if self._scaled_canvas is None or self._scaled_canvas.get_size() != size:
+            self._scaled_canvas = pg.Surface(size)
+        pg.transform.smoothscale(self.canvas, size, self._scaled_canvas)
+        self.screen.blit(self._scaled_canvas, self.offset)
         pg.display.flip()
 
     @staticmethod

@@ -15,6 +15,7 @@ static void videoTask(void *) {
   uint16_t port = 0;
   uint8_t token[4] = {};
   uint32_t renewed = 0, frame = 0;
+  uint32_t oversized = 0, failed = 0, reported = 0, lastSize = 0;
   uint8_t packet[1220];
   for (;;) {
     bool active = port && uint32_t(millis() - renewed) < 3000;
@@ -38,6 +39,8 @@ static void videoTask(void *) {
     camera_fb_t *fb = esp_camera_fb_get();
     if (!fb) { vTaskDelay(pdMS_TO_TICKS(20)); continue; }
     ++frame;
+    lastSize = fb->len;
+    if (fb->len > 262144) ++oversized;
     // Bound frame size and skip malformed JPEGs rather than displaying corruption.
     if (fb->format == PIXFORMAT_JPEG && fb->len >= 4 && fb->len <= 262144
         && fb->buf[0] == 0xff && fb->buf[1] == 0xd8
@@ -50,13 +53,21 @@ static void videoTask(void *) {
         size_t offset = size_t(i) * 1200;
         size_t size = min(size_t(1200), fb->len - offset);
         put16(packet + 16, i); memcpy(packet + 20, fb->buf + offset, size);
-        if (!udp.beginPacket(peer, port)) break;
-        if (udp.write(packet, size + 20) != size + 20 || !udp.endPacket()) break;
+        if (!udp.beginPacket(peer, port)) { ++failed; break; }
+        if (udp.write(packet, size + 20) != size + 20 || !udp.endPacket()) { ++failed; break; }
         // Yield between bursts to avoid filling Wi-Fi transmit buffers.
         if ((i & 7) == 7) vTaskDelay(1);
       }
     }
     esp_camera_fb_return(fb);
+    if (uint32_t(millis() - reported) >= 1000) {
+      memcpy(packet, "EVT1", 4); memcpy(packet + 4, token, 4);
+      put32(packet + 8, frame); put32(packet + 12, oversized);
+      put32(packet + 16, failed); put32(packet + 20, lastSize);
+      put32(packet + 24, esp_camera_sensor_get()->status.quality);
+      if (udp.beginPacket(peer, port)) { udp.write(packet, 28); udp.endPacket(); }
+      reported = millis();
+    }
     vTaskDelay(1);
   }
 }

@@ -2,6 +2,7 @@
 > For an offline preview use `elegoo-smartcar-control --dashboard-preview`.
 > See [dashboard usage](docs/dashboard/README.md) for Stop/Resume and display details.
 > The current tested firmware pair uses 38400 baud; earlier notes below describe bring-up history.
+> Latest desktop changes and the unflashed ESP32 diagnostic candidate are documented in [review fixes](docs/active-code-review-fixes.md).
 
 # ELEGOO Smart Robot Car V4 bring-up
 

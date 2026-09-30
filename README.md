@@ -21,8 +21,11 @@ illustrative values and a camera placeholder.*
   curves, a tuned minimum motor output, acceleration limiting, and extra steering
   authority while moving make fine adjustments easier. Both triggers together stop.
 - **Runtime camera presets:** switch between Fast (320×240), Drive (640×480),
-  Detail (1024×768) and Max detail (1600×1200). Changing modes holds the car
+  Balanced (800×600, applied on startup/reconnect) and Detail (1024×768). The
+  active preset is highlighted green after confirmation. Changing modes holds the car
   paused until settings, fresh video and neutral driving inputs are confirmed.
+  Detail can automatically increase JPEG compression when video is
+  stale, oversized or losing too many frames, preserving the selected resolution.
 - **Camera control:** the right stick sets the pan target and releasing it centres
   the camera. Servo firmware changes address idle twitch and pulse cutoff.
 - **A proper desktop dashboard:** a large camera view, clear driving/blocking
@@ -36,16 +39,32 @@ illustrative values and a camera placeholder.*
   there is no guaranteed latency figure for other networks or hardware.
 - **Reconnect without restarting:** the analogue dashboard automatically retries
   a lost control connection; its Reconnect button also restarts the link and video.
-  Keep the car stationary during sensor calibration. Fresh video and neutral
-  controls are required before driving, and manual Stop stays latched.
+  Fresh video and neutral controls are required before driving, and manual Stop
+  stays latched. Dashboard reconnect skips the unused IMU offset calibration.
 - **Explicit Stop/Resume:** Space or the Stop button latches driving off. Release
   the driving controls, then click Resume. Recovery from lost focus, stale video,
   or control errors also requires neutral controls.
 
 The indicators show requested inputs and acknowledged command targets, **not
 measured vehicle speed or physical servo position**. In the analogue dashboard,
-control I/O and reconnection run on a background worker so network timeouts do
-not freeze the interface. The legacy keyboard controller remains synchronous.
+control refresh runs independently of rendering, reads the latest demand just
+before sending, and forces zero wheel speeds when input expires. HTTP fallback
+capture has its own worker. The legacy keyboard controller remains synchronous.
+
+### Camera presets
+
+| Preset | Resolution | JPEG setting |
+| --- | --- | --- |
+| Fast | 320×240 | 20 |
+| Drive | 640×480 | 15 |
+| **Balanced — startup default** | **800×600** | **10** |
+| Detail | 1024×768 | 10, with adaptive compression |
+
+Startup and reconnect explicitly apply Balanced. Its button turns green once
+the settings and fresh video are confirmed. Lower JPEG numbers mean higher
+quality and larger frames. Max detail (1600×1200) was removed after repeated
+frame drops on the tested car. Detail retains its resolution while increasing
+compression if needed. Camera settings are applied at runtime without reflashing.
 
 ## Hardware and firmware
 
@@ -132,8 +151,13 @@ The legacy controller retains keyboard/gamepad input and its terminal menu for
 stock line tracking, obstacle avoidance and ultrasonic following. Those modes are
 not exposed in the dashboard. They retain the original synchronous behavior and
 do not gain the dashboard's reconnect and Stop/Resume interlocks. Autonomous
-navigation helpers remain available for explicit experiments; sensor APIs and
-startup IMU calibration remain part of normal operation. Firmware is unchanged.
+navigation helpers remain available for explicit experiments; sensor APIs remain
+available. The library's default `Car()` still calibrates for these helpers, while
+the manual dashboard skips calibration. Existing firmware supports the desktop
+fixes. The updated ESP32 diagnostic firmware adds video drop counters and has been
+flashed and verified on the development car. Other cars need a separate build and
+upload to gain those counters; the desktop also works without them. This diagnostic
+update does not require a UNO update.
 
 Vision activation may download model weights on first use. If optional
 dependencies are absent, activation reports the required extra and leaves tracking
@@ -147,6 +171,7 @@ not which source files go into the package.
 - [Control-link recovery](bringup/docs/control-recovery.md)
 - [Servo fixes](bringup/docs/servo-idle.md)
 - [Dashboard controls and validation](bringup/docs/dashboard/README.md)
+- [Active-code review fixes](bringup/docs/active-code-review-fixes.md)
 
 Tests cover mocked control faults, Stop/Resume interlocks, UDP handling, dashboard
 resizing and default startup with optional imports blocked. Run `pytest tests/ -q`
@@ -156,8 +181,13 @@ skip when those extras are absent; to exercise the retained features, run
 and limitations are recorded in the bring-up notes; automated tests do not replace
 an attended driving check on another car.
 
-Possible next steps include display toggles, calibrated vehicle-width and
-turning-path overlays.
+The dashboard uses a software window surface by default to avoid an observed
+X11/GLX startup crash in the Nix environment. No OpenGL context is required.
+
+The next planned feature is an optional calibrated vehicle-width overlay with
+clearance and distance guides. Camera-pan and approximate turning-path guides
+can follow after calibration. **These driving guides are not implemented yet**;
+the lines in the offline screenshot belong to the illustrated placeholder scene.
 
 ## Credits and license
 

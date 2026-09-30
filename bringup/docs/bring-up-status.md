@@ -393,3 +393,36 @@ after synchronizing the minimal environment, the full suite passed 152 tests wit
 two optional checks skipped. The wheel and source distribution build offline.
 The local environment now uses the minimal dependency set. No live robot commands
 or firmware changes were needed for this update.
+
+## 2026-09-30 — Active-code review fixes
+
+Pushed the pre-fix baseline as `1f604ed`. Implemented independent control refresh,
+latest-demand checks after sensor/UART waits, input expiry, kernel-timestamped UDP
+freshness, separate HTTP capture, short ground-query IDs, cancellable reconnect
+without unused IMU calibration, bounded adaptive JPEG quality and render caching.
+Added threaded tests exercising the active dashboard's stop paths and presets.
+Prepared and compiled a separate ESP32 candidate adding video drop counters;
+neither board was flashed. Details, build hash and remaining hardware validation
+are recorded in [active-code review fixes](active-code-review-fixes.md).
+
+### ESP32 upload and desktop startup follow-up
+
+Diagnostic application uploaded at 0x10000; upload hash and subsequent independent
+digest verification passed. Fresh full backup preserved the previous installation.
+Video-only validation received 174 frames in 15 seconds plus EVT1 diagnostic
+packets, without opening a control connection. UNO firmware is unchanged.
+Fixed a reproduced X11/GLX startup crash by defaulting the dashboard to a software
+window surface; the actual desktop window, redraw and resize check passed.
+Driving and power-cycle checks of the combined review fixes remain pending.
+
+### Preset refinement after driving feedback
+
+User reports the combined update works well. Replaced Max detail (1600×1200),
+which still dropped too many frames, with Balanced (800×600, JPEG 10). Balanced
+matches the installed camera startup settings and gives a way back after choosing
+another mode. Fast, Drive and Detail remain available. Balanced keeps its selected
+quality; adaptive compression remains available for Detail. No firmware update.
+
+Startup and reconnect now explicitly apply Balanced through the existing stop,
+settings-readback and fresh-frame gates. Its button turns green after confirmation.
+The active-loop tests verify Balanced is confirmed before driving becomes ready.

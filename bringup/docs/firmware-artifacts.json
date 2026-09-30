@@ -220,5 +220,49 @@
       "movement_tested": false
     },
     "physical_validation": "User reports good operation and no camera servo issues after update"
+  },
+  "camera_video_diagnostics": {
+    "path": ".cache/build/camera-video-diagnostics/ESP32_CameraServer_AP_20220120.ino.bin",
+    "sha256": "421da18be31f9a2218a80708367ba34559a321aa1f71de2dac8d2989fab5fe4a",
+    "program_bytes": 2613022,
+    "image_bytes": 2613136,
+    "global_ram_bytes": 56720,
+    "offset": "0x10000",
+    "serial_baud": 38400,
+    "upload_status": "uploaded 2026-09-30; upload hash and independent verify-flash digest matched; reset to app",
+    "backup": "logs/video-diagnostics-2026-09-30/pre-update-flash.bin",
+    "backup_sha256": "1bd8658521476cfa56f15b898c61644ba6cd3422a7be34b1b23b913ce86d95b0",
+    "validation": {
+      "frames": 174,
+      "seconds": 15.00013780593872,
+      "shape": [
+        600,
+        800,
+        3
+      ],
+      "age": 0.1261702898191288,
+      "diagnostics": {
+        "completed": 174,
+        "incomplete": 0,
+        "expired": 0,
+        "last_jpeg_bytes": 24555,
+        "receive_buffer_bytes": 2097152,
+        "stale": 0,
+        "kernel_timestamps": true,
+        "sender": {
+          "frames": 184,
+          "oversized": 0,
+          "failed": 0,
+          "bytes": 24658,
+          "quality": 10
+        }
+      },
+      "error": null,
+      "camera": {
+        "framesize": 9,
+        "quality": 10
+      },
+      "control_connection_opened": false
+    }
   }
 }

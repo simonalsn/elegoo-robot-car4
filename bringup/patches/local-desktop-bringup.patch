@@ -142,11 +142,132 @@ index 0000000..3ca8153
 +        delta = max(-450*dt, min(450*dt, target-self.head))
 +        self.head += delta
 +        return round(self.left), round(self.right), round(self.head)
+diff --git a/src/elegoo_robot_car4/camera_presets.py b/src/elegoo_robot_car4/camera_presets.py
+new file mode 100644
+index 0000000..09a2021
+--- /dev/null
++++ b/src/elegoo_robot_car4/camera_presets.py
+@@ -0,0 +1,115 @@
++"""Runtime presets for the installed Arduino-ESP32 1.0.6 camera firmware."""
++from dataclasses import dataclass
++from queue import Queue, Empty
++from threading import Thread, Lock, Event
++import requests
++
++
++@dataclass(frozen=True)
++class CameraPreset:
++    name: str
++    size: tuple[int, int]
++    quality: int
++    framesize: int
++
++
++# Enum IDs from the installed 1.0.6 sensor.h, not the current ESP-IDF driver.
++PRESETS = {
++    'fast': CameraPreset('Fast', (320, 240), 20, 5),
++    'drive': CameraPreset('Drive', (640, 480), 15, 8),
++    'balanced': CameraPreset('Balanced', (800, 600), 10, 9),
++    'detail': CameraPreset('Detail', (1024, 768), 10, 10),
++}
++
++
++def apply_preset(host, key, get=None, cancelled=None):
++    """Use one HTTP connection for the transaction; failures may be partial."""
++    if get is None:
++        with requests.Session() as session:
++            return apply_preset(host, key, session.get, cancelled)
++    quality_only = key.startswith('quality:')
++    if quality_only:
++        quality = int(key.split(':')[1])
++        if not 10 <= quality <= 40:
++            raise ValueError('Adaptive JPEG quality outside supported range')
++        settings = [('quality', quality)]
++    else:
++        preset = PRESETS[key]
++        quality = preset.quality
++        settings = [('quality', quality), ('framesize', preset.framesize)]
++    for variable, value in settings:
++        if cancelled is not None and cancelled.is_set():
++            raise ValueError('Camera setting cancelled')
++        response = get(f'http://{host}/control', params={'var': variable, 'val': value}, timeout=(2, 3))
++        try:
++            response.raise_for_status()
++        finally:
++            response.close()
++    if cancelled is not None and cancelled.is_set():
++        raise ValueError('Camera setting cancelled')
++    response = get(f'http://{host}/status', timeout=(2, 3))
++    try:
++        response.raise_for_status()
++        status = response.json()
++    finally:
++        response.close()
++    if not isinstance(status, dict):
++        raise ValueError('Invalid camera status response')
++    if status.get('quality') != quality or (not quality_only and status.get('framesize') != preset.framesize):
++        raise ValueError('Camera settings did not match the requested preset')
++
++
++class CameraSettings:
++    """Single background request; no pygame calls or shared control socket."""
++    def __init__(self, host):
++        self.host = host
++        self.results = Queue()
++        self.busy = False
++        # The legacy ESP32 has a small socket pool. Keep a single HTTP connection
++        # across writes, readback AND later preset selections, instead of opening
++        # a fresh connection for every requests.get().
++        self._session = requests.Session()
++        self._lock = Lock()
++        self._working = False
++        self._closed = False
++        self._cancel = Event()
++        self.quality = None
++
++    def close(self):
++        with self._lock:
++            self._closed = True
++            self._cancel.set()
++            if not self._working:
++                self._session.close()
++
++    def start(self, key):
++        with self._lock:
++            quality_only = key.startswith('quality:') and key.split(':')[1].isdigit() and 10 <= int(key.split(':')[1]) <= 40
++            if (key not in PRESETS and not quality_only) or self.busy or self._closed:
++                return False
++            self.busy = self._working = True
++        def work():
++            try:
++                apply_preset(self.host, key, self._session.get, self._cancel)
++                result = (key, None)
++            except (requests.RequestException, ValueError) as exc:
++                result = (key, f'{type(exc).__name__}: {exc}')
++            finally:
++                with self._lock:
++                    self._working = False
++                    if self._closed:
++                        self._session.close()
++            self.results.put(result)
++        Thread(target=work, name='camera-settings', daemon=True).start()
++        return True
++
++    def poll(self):
++        try:
++            result = self.results.get_nowait()
++        except Empty:
++            return None
++        self.busy = False
++        key, error = result
++        if error is None:
++            self.quality = int(key.split(':')[1]) if key.startswith('quality:') else PRESETS[key].quality
++        return result
 diff --git a/src/elegoo_robot_car4/car.py b/src/elegoo_robot_car4/car.py
-index ed641e9..3893b3f 100644
+index ed641e9..56f9979 100644
 --- a/src/elegoo_robot_car4/car.py
 +++ b/src/elegoo_robot_car4/car.py
-@@ -1,18 +1,27 @@
+@@ -1,18 +1,28 @@
  #  Copyright (c) Michele De Stefano - 2026.
 +from __future__ import annotations
 +
@@ -154,6 +275,7 @@ index ed641e9..3893b3f 100644
  import re
  import socket
 +import time
++import threading
  from collections import deque
  from collections.abc import Callable
  from contextlib import AbstractContextManager, suppress
@@ -178,16 +300,21 @@ index ed641e9..3893b3f 100644
  
  
  class Car(AbstractContextManager):
-@@ -83,6 +92,7 @@ class Car(AbstractContextManager):
+@@ -83,6 +93,9 @@ class Car(AbstractContextManager):
          port: int = 100,
          log: bool = False,
          dry_run: bool = False,
 +        stop_before_init: bool = False,
++        initialize: bool = True,
++        cancel_event: threading.Event | None = None,
      ):
          """
          Initializes the connection with the car.
-@@ -100,6 +110,10 @@ class Car(AbstractContextManager):
+@@ -98,8 +111,13 @@ class Car(AbstractContextManager):
+         self.__state = "stop"
+         self.log = log
          self.__dry_run = dry_run
++        self.__cancel_event = cancel_event or threading.Event()
          self.__cmd_queue = deque()
          self.__recv_msg_queue = ""
 +        self.__command_ready_at = 0.0
@@ -197,7 +324,7 @@ index ed641e9..3893b3f 100644
          self.__head_servo_angle = 90
          self.__a_offsets = np.zeros(3)
          self.__g_offsets = np.zeros(3)
-@@ -111,9 +125,15 @@ class Car(AbstractContextManager):
+@@ -111,9 +129,17 @@ class Car(AbstractContextManager):
              # Set a timeout of 2 seconds for all the blocking operations on
              # this socket
              self.__socket.settimeout(2)
@@ -206,17 +333,19 @@ index ed641e9..3893b3f 100644
 -            self.set_head_angle()
 +            try:
 +                self.__socket.connect((ip, port))
++                self.__socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 +                if stop_before_init:
 +                    self.stop()
-+                self.__compute_mpu_offsets()
-+                self.set_head_angle()
++                if initialize:
++                    self.__compute_mpu_offsets()
++                    self.set_head_angle()
 +            except Exception:
 +                self.__socket.close()
 +                raise
  
      def __exit__(self, exc_type, exc_val, exc_tb):
          self.disconnect()
-@@ -159,10 +179,10 @@ class Car(AbstractContextManager):
+@@ -159,10 +185,10 @@ class Car(AbstractContextManager):
              on: If True, switches the vision-tracking mode on. Otherwise it
                  switches it off.
          """
@@ -231,7 +360,19 @@ index ed641e9..3893b3f 100644
  
      def disconnect(self) -> None:
          """
-@@ -181,9 +201,15 @@ class Car(AbstractContextManager):
+@@ -171,6 +197,11 @@ class Car(AbstractContextManager):
+         with suppress(BaseException):
+             self.__socket.close()
+ 
++    def cancel(self):
++        self.__cancel_event.set()
++        with suppress(OSError, AttributeError):
++            self.__socket.shutdown(socket.SHUT_RDWR)
++
+     def capture(self) -> np.ndarray:
+         """
+         Takes a snapshot from the robot's camera.
+@@ -181,9 +212,15 @@ class Car(AbstractContextManager):
          """
          if self.__dry_run:
              return np.array([])
@@ -250,7 +391,16 @@ index ed641e9..3893b3f 100644
  
      def track(self, frame: np.ndarray, **kwargs) -> list[Results]:
          """
-@@ -387,6 +413,29 @@ class Car(AbstractContextManager):
+@@ -358,7 +395,7 @@ class Car(AbstractContextManager):
+             True if the car is far from the ground. False otherwise.
+             The result is deduced from the IR sensor readings.
+         """
+-        cmd_id = f"Leaves_the_ground_{np.random.randint(0, 1 << 32)}"
++        cmd_id = f"g{np.random.randint(0, 1 << 16):04x}"
+         cmd = {"H": cmd_id, "N": 23}
+         self.__send_cmd(cmd)
+         pattern = f"{{{cmd_id}_(true|false)}}"
+@@ -387,6 +424,30 @@ class Car(AbstractContextManager):
          expected_pattern = f"{{{cmd_id}_ok}}"
          self.__recv_until_confirmation(expected_pattern)
  
@@ -266,21 +416,22 @@ index ed641e9..3893b3f 100644
 +        self.__serial_baud = 38400 if "2_38400" in reply else 115200
 +        self.__analogue_ready = True
 +
-+    def drive_analogue(self, left: int, right: int, head: int):
++    def drive_analogue(self, left: int, right: int, head: int, *, latest=None):
 +        """One acknowledged wheel/pan update; firmware expires it after 400 ms."""
 +        if not self.__analogue_ready:
 +            raise RuntimeError("Analogue drive firmware handshake has not succeeded")
 +        if not (-200 <= left <= 200 and -200 <= right <= 200 and -80 <= head <= 80):
 +            raise ValueError("Wheel or camera command outside supported range")
 +        self.__drive_sequence = (self.__drive_sequence + 1) & 0xffff
-+        self.__process_cmd({"H": f"d{self.__drive_sequence}", "N": 1001,
-+                            "D1": int(left), "D2": int(right), "D3": int(head)+90}, False)
-+        self.__head_servo_angle = int(head)+90
++        command = {"H": f"d{self.__drive_sequence}", "N": 1001,
++                   "D1": int(left), "D2": int(right), "D3": int(head)+90}
++        self.__process_cmd(command, False, latest=latest)
++        self.__head_servo_angle = command['D3']
 +
      def forward(self, speed: int = 50, lazy: bool = False) -> None:
          """
          Moves forward.
-@@ -444,6 +493,7 @@ class Car(AbstractContextManager):
+@@ -444,6 +505,7 @@ class Car(AbstractContextManager):
              angle:  The rotation angle in degrees. Positive angle is
                      counterclockwise.
          """
@@ -288,7 +439,7 @@ index ed641e9..3893b3f 100644
          if self.log:  # pragma: no cover
              print("====== TURNING ======")
          # NOTE: I experimentally found that speed = 50 grants an accurate
-@@ -463,7 +513,7 @@ class Car(AbstractContextManager):
+@@ -463,7 +525,7 @@ class Car(AbstractContextManager):
              t = mpu_data["t"]
              delta_t = t - t0
              wz = mpu_data["g"][-1] - self.__g_offsets[-1]
@@ -297,35 +448,48 @@ index ed641e9..3893b3f 100644
              alpha += delta_angle
              if self.log:  # pragma: no cover
                  print(f"delta_t = {delta_t}")
-@@ -745,9 +795,14 @@ class Car(AbstractContextManager):
+@@ -744,10 +806,22 @@ class Car(AbstractContextManager):
+             self.__head_servo_angle = state_cmd["D2"]
          self.__state = new_state
  
-     def __send_cmd(self, cmd_data: dict) -> None:
+-    def __send_cmd(self, cmd_data: dict) -> None:
 -        json_cmd = json.dumps(cmd_data).encode()
++    def __send_cmd(self, cmd_data: dict, latest=None) -> None:
++        if not self.__dry_run:
++            # Use the negotiated UART speed; legacy firmware remains at 9600.
++            # In particular, leave room after commands with no response.
++            if self.__cancel_event.wait(max(0.0, self.__command_ready_at - time.monotonic())):
++                raise ConnectionAbortedError('Control operation cancelled')
++        if latest is not None:
++            left, right, head = latest()
++            if not (-200 <= left <= 200 and -200 <= right <= 200 and -80 <= head <= 80):
++                raise ValueError('Wheel or camera command outside supported range')
++            cmd_data.update(D1=int(left), D2=int(right), D3=int(head)+90)
 +        json_cmd = (json.dumps(cmd_data, separators=(",", ":")) if self.__analogue_ready
 +                    else json.dumps(cmd_data)).encode()
          if not self.__dry_run:
-+            # Use the negotiated UART speed; legacy firmware remains at 9600.
-+            # In particular, leave room after commands with no response.
-+            time.sleep(max(0.0, self.__command_ready_at - time.monotonic()))
              self.__socket.sendall(json_cmd)
 +            self.__command_ready_at = time.monotonic() + len(json_cmd) * 10 / self.__serial_baud + (0.002 if self.__analogue_ready else 0.03)
          if self.log:  # pragma: no cover
              print(f"Sent command: {json_cmd}")
  
-@@ -756,8 +811,30 @@ class Car(AbstractContextManager):
+@@ -756,8 +830,34 @@ class Car(AbstractContextManager):
              return ""
          pattern = re.compile(expected_confirmation)
          m = pattern.search(self.__recv_msg_queue)
 +        deadline = time.monotonic() + 2.0
          while not m:
 -            self.__recv_msg_queue += self.__socket.recv(4096).decode()
++            if self.__cancel_event.is_set():
++                raise ConnectionAbortedError('Control operation cancelled')
 +            remaining = deadline - time.monotonic()
 +            if remaining <= 0:
 +                raise TimeoutError("Robot command response timed out")
-+            self.__socket.settimeout(remaining)
++            self.__socket.settimeout(min(remaining, .1))
 +            try:
 +                received = self.__socket.recv(4096)
++            except socket.timeout:
++                continue
 +            finally:
 +                self.__socket.settimeout(2)
 +            if not received:
@@ -345,15 +509,199 @@ index ed641e9..3893b3f 100644
              # Remove all received {Heartbeat} messages
              self.__recv_msg_queue = self.__heartbeat_re.sub(
                  "", self.__recv_msg_queue
+@@ -770,11 +870,14 @@ class Car(AbstractContextManager):
+         self.__recv_msg_queue = pattern.sub("", self.__recv_msg_queue)
+         return m.group(0)
+ 
+-    def __process_cmd(self, cmd: dict, lazy: bool) -> None:
++    def __process_cmd(self, cmd: dict, lazy: bool, latest=None) -> None:
+         if lazy:
+             self.__cmd_queue += [cmd]
+             return
+-        self.__send_cmd(cmd)
++        if latest is None:
++            self.__send_cmd(cmd)
++        else:
++            self.__send_cmd(cmd, latest=latest)
+         new_state = cmd["H"]
+         wait_for_confirmation = new_state not in self.__no_response_cmds
+         if wait_for_confirmation:
+diff --git a/src/elegoo_robot_car4/connection.py b/src/elegoo_robot_car4/connection.py
+new file mode 100644
+index 0000000..3c503b1
+--- /dev/null
++++ b/src/elegoo_robot_car4/connection.py
+@@ -0,0 +1,159 @@
++"""Serialized dashboard I/O. No command queue survives a reconnect."""
++from concurrent.futures import ThreadPoolExecutor
++from contextlib import suppress
++import time
++from queue import Queue, Empty, Full
++from threading import Event, Lock
++
++from .car import Car
++from .udp_video import UdpVideo
++from .http_video import HttpVideo
++
++
++class Connection:
++    def __init__(self, ip, transport, log=False, car_factory=Car, video_factory=UdpVideo):
++        self.ip, self.transport, self.log = ip, transport, log
++        self.car_factory, self.video_factory = car_factory, video_factory
++        self.car = self.video = None
++        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='car-link')
++        self.pending = None
++        self.closed = False
++        self.generation = 0
++        self.ground_checked = -float("inf")
++        self.raised = True
++        self._cancel = Event()
++        self._wake = Event()
++        self._lock = Lock()
++        self._demand = ((0, 0, 0), 0, 0.0)
++        self._results = Queue(maxsize=1)
++        self.input_expired = False
++
++    def submit(self, operation, *args):
++        if self.pending is not None or self.closed:
++            return False
++        self.pending = self.executor.submit(operation, *args)
++        return True
++
++    def poll(self):
++        if self.pending is None or not self.pending.done():
++            try:
++                return True, self._results.get_nowait()
++            except Empty:
++                return None
++        future, self.pending = self.pending, None
++        try:
++            return True, future.result()
++        except Exception as exc:
++            return False, exc
++
++    def disconnect(self):
++        if self.car is not None:
++            with suppress(Exception):
++                self.car.stop()
++            self.car.disconnect()
++            self.car = None
++        if self.video is not None:
++            self.video.close()
++            self.video = None
++
++    def connect(self):
++        self.disconnect()
++        if self._cancel.is_set() or self.closed:
++            raise ConnectionAbortedError('Connection cancelled')
++        self.ground_checked = -float("inf")
++        self.raised = True
++        try:
++            self.car = self.car_factory(ip=self.ip, log=self.log, stop_before_init=True,
++                                        initialize=False, cancel_event=self._cancel)
++            self.car.enable_analogue_drive()
++            self.car.drive_analogue(0, 0, 0)
++            if self.transport == 'udp':
++                self.video = self.video_factory(self.ip)
++            else:
++                self.video = HttpVideo(self.ip)
++        except Exception:
++            self.disconnect()
++            raise
++
++    def invalidate(self):
++        with self._lock:
++            previous = self._demand[0]
++            self.generation += 1
++            self._demand = ((0, 0, previous[2]), self.generation, time.monotonic())
++        if previous[:2] != (0, 0):
++            self._wake.set()
++
++    def prepare_connect(self):
++        self._cancel = Event()
++        while not self._results.empty():
++            with suppress(Empty):
++                self._results.get_nowait()
++
++    def interrupt(self):
++        self.invalidate()
++        self._cancel.set()
++        self._wake.set()
++        if self.car is not None:
++            self.car.cancel()
++
++    def update_demand(self, demand):
++        with self._lock:
++            previous = self._demand[0]
++            self._demand = (demand, self.generation, time.monotonic())
++            if demand[:2] == (0, 0):
++                self.input_expired = False
++        if demand[:2] == (0, 0) and previous[:2] != (0, 0):
++            self._wake.set()
++
++    def current_demand(self):
++        with self._lock:
++            demand, generation, sampled = self._demand
++            expired = time.monotonic()-sampled > .15
++            if expired and demand[:2] != (0, 0):
++                self.input_expired = True
++            if (expired or self.input_expired or generation != self.generation or self.raised
++                    or self.closed or self._cancel.is_set()):
++                return 0, 0, demand[2]
++            return demand
++
++    def start_control(self):
++        return self.submit(self._control_loop)
++
++    def _control_loop(self):
++        while not self._cancel.is_set() and not self.closed:
++            started = time.monotonic()
++            result = self.exchange(self.current_demand(), latest=self.current_demand)
++            with suppress(Empty):
++                self._results.get_nowait()
++            with suppress(Full):
++                self._results.put_nowait(result)
++            self._wake.wait(max(0, 1/30-(time.monotonic()-started)))
++            self._wake.clear()
++
++    def exchange(self, demand, generation=None, latest=None):
++        started = time.monotonic()
++        # Keep the original 10 Hz sensor budget on the 38400-baud serial link.
++        if time.monotonic()-self.ground_checked >= .1:
++            self.raised = self.car.is_far_from_the_ground()
++            self.ground_checked = time.monotonic()
++        raised = self.raised
++        left, right, head = demand
++        if raised or self.closed or (generation is not None and generation != self.generation):
++            left = right = 0
++        sent = [(left, right, head)]
++        if latest is None:
++            self.car.drive_analogue(left, right, head)
++        else:
++            def refresh():
++                sent[0] = latest()
++                return sent[0]
++            self.car.drive_analogue(*refresh(), latest=refresh)
++        ack = time.monotonic()
++        return raised, sent[0], (ack-started)*1000, ack, None
++
++    def close(self):
++        self.closed = True
++        self.interrupt()
++        # Cleanup is serialized behind any in-flight call, never concurrent with recv.
++        self.executor.submit(self.disconnect)
++        self.executor.shutdown(wait=False)
 diff --git a/src/elegoo_robot_car4/dashboard.py b/src/elegoo_robot_car4/dashboard.py
 new file mode 100644
-index 0000000..acdc943
+index 0000000..6331ffd
 --- /dev/null
 +++ b/src/elegoo_robot_car4/dashboard.py
-@@ -0,0 +1,277 @@
+@@ -0,0 +1,296 @@
 +"""Pygame driving dashboard. Rendering has no robot or gamepad side effects."""
 +from dataclasses import dataclass
 +import math
++import os
++from collections import OrderedDict
 +import pygame as pg
 +from .camera_presets import PRESETS
 +
@@ -399,6 +747,10 @@ index 0000000..acdc943
 +    PRESET_RECTS = {key: pg.Rect(244+i*246, 876, 234, 43) for i, key in enumerate(PRESETS)}
 +
 +    def __init__(self, robot_ip='', transport='udp', preview=False):
++        # Our Surface renderer needs no OpenGL context. SDL's automatic window
++        # acceleration can terminate X11 clients on incompatible GLX drivers.
++        # Keep an explicit user override available for other display setups.
++        os.environ.setdefault('SDL_FRAMEBUFFER_ACCELERATION', '0')
 +        pg.font.init()
 +        self.screen = pg.display.set_mode((1200, 960), pg.RESIZABLE)
 +        self.canvas = pg.Surface(self.SIZE)
@@ -407,6 +759,10 @@ index 0000000..acdc943
 +        self.frame = None
 +        self.frame_size = None
 +        self._scaled_frame = None
++        self._text_cache = OrderedDict()
++        self._scaled_canvas = None
++        self._stale_overlay = pg.Surface((864, 648), pg.SRCALPHA)
++        self._stale_overlay.fill((12, 20, 26, 185))
 +        self.offset = (0, 0)
 +        self.scale = 1.0
 +        self._transform()
@@ -445,7 +801,15 @@ index 0000000..acdc943
 +        self._scaled_frame = (pg.transform.smoothscale(surface, rect.size), rect)
 +
 +    def text(self, text, x, y, size=18, color=None):
-+        self.canvas.blit(self.fonts[size].render(str(text), True, color or self.TEXT), (x, y))
++        key = (str(text), size, tuple(pg.Color(color or self.TEXT)))
++        surface = self._text_cache.get(key)
++        if surface is None:
++            surface = self.fonts[size].render(key[0], True, key[2])
++            self._text_cache[key] = surface
++            if len(self._text_cache) > 256:
++                self._text_cache.popitem(last=False)
++        self._text_cache.move_to_end(key)
++        self.canvas.blit(surface, (x, y))
 +
 +    def wrapped(self, text, x, y, width, size=16, color=None):
 +        words, line = text.split(), ''
@@ -496,9 +860,7 @@ index 0000000..acdc943
 +                pg.draw.line(self.canvas, '#ffffff', (446, 464), (466, 464))
 +                pg.draw.line(self.canvas, '#ffffff', (456, 454), (456, 474))
 +        if state.video_stale:
-+            overlay = pg.Surface((864, 648), pg.SRCALPHA)
-+            overlay.fill((12, 20, 26, 185))
-+            self.canvas.blit(overlay, (24, 140))
++            self.canvas.blit(self._stale_overlay, (24, 140))
 +            self.text('Waiting for fresh video', 298, 433, 28)
 +            self.text('Driving is blocked while the image is stale.', 276, 479, 18, self.MUTED)
 +        else:
@@ -509,7 +871,7 @@ index 0000000..acdc943
 +        if state.ack_at is not None and now-state.ack_at >= 2:
 +            ack += ' (old)'
 +        metrics = [('VIDEO RATE', '--' if state.fps is None else f'{state.fps:.1f} fps'),
-+                   ('RECEIVE AGE', age), ('LAST CONTROL REPLY', ack)]
++                   ('RECEIVE AGE', age), ('CONTROL EXCHANGE', ack)]
 +        for x, (title, value) in zip((42, 325, 608), metrics):
 +            self.text(title, x, 798, 14, self.MUTED)
 +            self.text(value, x, 819, 18)
@@ -569,7 +931,10 @@ index 0000000..acdc943
 +        self._transform()
 +        size = (round(self.SIZE[0]*self.scale), round(self.SIZE[1]*self.scale))
 +        self.screen.fill(self.BG)
-+        self.screen.blit(pg.transform.smoothscale(self.canvas, size), self.offset)
++        if self._scaled_canvas is None or self._scaled_canvas.get_size() != size:
++            self._scaled_canvas = pg.Surface(size)
++        pg.transform.smoothscale(self.canvas, size, self._scaled_canvas)
++        self.screen.blit(self._scaled_canvas, self.offset)
 +        pg.display.flip()
 +
 +    @staticmethod
@@ -629,10 +994,10 @@ index 0000000..acdc943
 +    finally:
 +        pg.quit()
 diff --git a/src/elegoo_robot_car4/elegoo_smartcar_control.py b/src/elegoo_robot_car4/elegoo_smartcar_control.py
-index 3269509..65045d3 100644
+index 3269509..d922188 100644
 --- a/src/elegoo_robot_car4/elegoo_smartcar_control.py
 +++ b/src/elegoo_robot_car4/elegoo_smartcar_control.py
-@@ -1,22 +1,34 @@
+@@ -1,22 +1,35 @@
  #  Copyright (c) Michele De Stefano - 2023.
 +from __future__ import annotations
  
@@ -659,6 +1024,7 @@ index 3269509..65045d3 100644
 +from .analogue_drive import AnalogueDrive
 +from .dashboard import Dashboard, DashboardState
 +from .camera_presets import CameraSettings, PRESETS
++from .video_adaptation import VideoAdaptation
 +
 +if TYPE_CHECKING:
 +    from ultralytics.engine.results import Results
@@ -671,7 +1037,7 @@ index 3269509..65045d3 100644
      __head_delta: int = 10
      __min_speed: int = 50
      __max_speed: int = 200
-@@ -44,7 +56,7 @@ class GameEngine:
+@@ -44,7 +57,7 @@ class GameEngine:
      __person_follower: PersonFollower
      __run_person_follower: bool
  
@@ -680,7 +1046,7 @@ index 3269509..65045d3 100644
          """
          Constructor.
  
-@@ -56,22 +68,47 @@ class GameEngine:
+@@ -56,22 +69,49 @@ class GameEngine:
              dry_run:    Set this to True for debugging purpose (no socket call
                          will be actually made).
          """
@@ -704,6 +1070,8 @@ index 3269509..65045d3 100644
 +        self.__fps_sample = (time.monotonic(), 0)
 +        self.__http_frames = 0
 +        self.__trace_camera = trace_camera
++        self.__adaptation = VideoAdaptation()
++        self.__requested_preset = None
 +        if analogue_drive and not self.__connection:
 +            try:
 +                self.__car.enable_analogue_drive()
@@ -734,7 +1102,7 @@ index 3269509..65045d3 100644
          pg.display.set_caption("Elegoo Smart Robot Car v4.0 controller")
  
          self.__delta_speed = self.__max_speed - self.__min_speed
-@@ -82,14 +119,54 @@ class GameEngine:
+@@ -82,14 +122,54 @@ class GameEngine:
      def __exit__(self, exc_type, exc_val, exc_tb):
          self.release_resources()
  
@@ -791,7 +1159,7 @@ index 3269509..65045d3 100644
  
      def __process_frame(self, frame: np.ndarray) -> np.ndarray:
          if self.__car.vision_tracking_is_on:
-@@ -114,56 +191,290 @@ class GameEngine:
+@@ -114,56 +194,315 @@ class GameEngine:
          Runs the game loop, translating player commands to the robot.
          """
  
@@ -912,6 +1280,7 @@ index 3269509..65045d3 100644
 +        preset_requested = None
 +        http_frame = None
 +        http_at = 0.0
++        self.__render_at = 0.0
 +
 +        def reset_view():
 +            link.invalidate()
@@ -923,6 +1292,8 @@ index 3269509..65045d3 100644
 +            self.__dashboard.frame = self.__dashboard._scaled_frame = None
 +            self.__dashboard.frame_size = None
 +            self.__preset_wait = None
++            self.__requested_preset = None
++            self.__adaptation.reset(time.monotonic())
 +            self.__http_frames = 0
 +            ui.preset_error = False
 +            ui.ack_at = ui.ack_ms = ui.fps = ui.preset = None
@@ -930,11 +1301,11 @@ index 3269509..65045d3 100644
 +            ui.video_stale = True
 +            ui.preset_pending = False
 +            ui.can_resume = False
-+            ui.preset_message = 'Reconnect resets camera state; select a preset once connected.'
++            ui.preset_message = 'Balanced will be applied once connected.'
 +
 +        reset_view()
 +        while True:
-+            clock.tick(30)
++            clock.tick(120)
 +            events = pg.event.get()
 +            if any(e.type == pg.QUIT or (e.type == pg.KEYDOWN and e.key == pg.K_ESCAPE) for e in events):
                  break
@@ -947,6 +1318,7 @@ index 3269509..65045d3 100644
 +                zero_confirmed = False
 +                self.__analogue.stop()
 +            if 'reconnect' in actions:
++                link.interrupt()
 +                reconnect, connected = True, False
 +                retry_at = 0
 +                preset_requested = None
@@ -959,9 +1331,11 @@ index 3269509..65045d3 100644
 +            if result is not None:
 +                ok, value = result
 +                if not ok:
-+                    print(f'Car link failed; reconnecting: {value}', flush=True)
++                    cancelled = reconnect and isinstance(value, ConnectionAbortedError)
++                    if not cancelled:
++                        print(f'Car link failed; reconnecting: {value}', flush=True)
 +                    reconnect, connected = True, False
-+                    retry_at = time.monotonic()+2
++                    retry_at = time.monotonic()+(0 if cancelled else 2)
 +                    preset_requested = None
 +                    http_frame = None
 +                    zero_confirmed = False
@@ -972,7 +1346,15 @@ index 3269509..65045d3 100644
 +                        self.__car, self.__video = link.car, link.video
 +                        self.__fps_sample = (time.monotonic(), 0)
 +                        zero_confirmed = True
-+                elif not reconnect and connected:
++                        operation = 'control'
++                        link.update_demand((0, 0, 0))
++                        link.start_control()
++                        # Apply the startup preset through the same zero-speed,
++                        # settings-readback and fresh-frame gates as a button click.
++                        preset_requested = self.__requested_preset = 'balanced'
++                        ui.preset_pending = True
++                        ui.preset_message = 'Stopping before applying Balanced.'
++                elif not reconnect and connected and value is not None:
 +                    raised, wheels, ui.ack_ms, ui.ack_at, frame = value
 +                    ui.left, ui.right, ui.head = wheels
 +                    self.__trace_camera_command(getattr(self, "_GameEngine__submitted_camera", 0), wheels[2])
@@ -984,19 +1366,19 @@ index 3269509..65045d3 100644
 +                    if preset_requested and zero_confirmed:
 +                        self.__camera_settings.start(preset_requested)
 +                        preset_requested = None
-+                operation = None
 +
 +            self.__poll_camera_settings()
-+            if reconnect and link.pending is None and not self.__camera_settings.busy and time.monotonic() >= retry_at:
++            if reconnect and link.pending is None and time.monotonic() >= retry_at:
 +                reset_view()
 +                self.__camera_settings.close()
 +                self.__camera_settings = CameraSettings(link.ip)
 +                reconnect = False
++                link.prepare_connect()
 +                operation = 'connect'
 +                link.submit(link.connect)
 +
 +            if not connected:
-+                self.__dashboard_status('Reconnecting', 'Keep the car stationary for sensor calibration. Retrying automatically; Stop stays latched.')
++                self.__dashboard_status('Reconnecting', 'Checking firmware and zero wheel speeds. Retrying automatically; Stop stays latched.')
 +                self.__render_dashboard()
 +                continue
  
@@ -1034,10 +1416,24 @@ index 3269509..65045d3 100644
 +            for action in actions:
 +                if isinstance(action, str) and action.startswith('preset:') and not ui.preset_pending and 'stop' not in actions:
 +                    preset_requested = action.split(':', 1)[1]
++                    self.__requested_preset = preset_requested
++                    self.__adaptation.reset(time.monotonic())
 +                    ui.preset_pending = True
 +                    ui.preset_error = False
 +                    ui.preset = None
 +                    ui.preset_message = 'Stopping before applying '+PRESETS[preset_requested].name+'.'
++                    self.__neutral_required = True
++
++            if (self.__video is not None and link.transport == 'udp' and not ui.preset_pending
++                    and not self.__camera_settings.busy and ui.ack_at is not None
++                    and time.monotonic()-ui.ack_at < .5):
++                quality = self.__adaptation.recommend(
++                    self.__video.diagnostics(), ui.frame_age, self.__requested_preset,
++                    self.__camera_settings.quality, time.monotonic())
++                if quality is not None:
++                    preset_requested = f'quality:{quality}'
++                    ui.preset_pending = True
++                    ui.preset_message = f'Video exceeds its budget; stopping before adjusting JPEG quality to {quality}.'
 +                    self.__neutral_required = True
 +
 +            pad = next((p for p in self.__joysticks.values() if p.attached()), None)
@@ -1051,7 +1447,7 @@ index 3269509..65045d3 100644
 +            neutral = forward <= .04 and reverse <= .04 and abs(steering) <= .08
 +            ui.throttle = 0 if forward > .04 and reverse > .04 else forward-reverse
 +            ui.steering = steering
-+            healthy = fresh and not raised and pad is not None and focused and not ui.preset_pending
++            healthy = fresh and not raised and pad is not None and focused and not ui.preset_pending and not link.input_expired
 +            if not healthy:
 +                link.invalidate()
 +                self.__neutral_required = True
@@ -1077,16 +1473,13 @@ index 3269509..65045d3 100644
 +            else:
 +                self.__dashboard_status('Ready' if neutral else 'Driving', 'Manual input active. You have control.', 'good')
 +
-+            # Sample only when the worker is available: never queue stale motor demands.
-+            if link.pending is None:
-+                if not healthy or was_blocked:
-+                    self.__analogue.stop()
-+                    demand = (0, 0, round(self.__analogue.head))
-+                else:
-+                    demand = self.__analogue.update(forward, reverse, steering, camera, time.monotonic())
-+                self.__submitted_camera = camera
-+                operation = 'exchange'
-+                link.submit(link.exchange, demand, link.generation)
++            if not healthy or was_blocked:
++                self.__analogue.stop()
++                demand = (0, 0, round(self.__analogue.head))
++            else:
++                demand = self.__analogue.update(forward, reverse, steering, camera, time.monotonic())
++            self.__submitted_camera = camera
++            link.update_demand(demand)
 +            self.__render_dashboard()
 +
 +    def __detect_relevant_events(self, events: list[pg.Event]) -> None:
@@ -1124,7 +1517,7 @@ index 3269509..65045d3 100644
  
      def __handle_keyboard_player_actions(self) -> dict[str, int | str | None]:
          retval: dict[str, int | str | None] = {
-@@ -186,86 +497,258 @@ class GameEngine:
+@@ -186,86 +525,265 @@ class GameEngine:
                      break
          return retval
  
@@ -1355,12 +1748,13 @@ index 3269509..65045d3 100644
 +            else:
 +                now = time.monotonic()
 +                self.__preset_wait = (key, now, now+8)
-+                self.__ui.preset_message = 'Settings accepted; waiting for a fresh '+PRESETS[key].name+' frame.'
++                name = 'JPEG '+key.split(':')[1] if key.startswith('quality:') else PRESETS[key].name
++                self.__ui.preset_message = 'Settings accepted; waiting for a fresh '+name+' frame.'
 +        wait = getattr(self, "_GameEngine__preset_wait", None)
 +        if wait and time.monotonic() > wait[2]:
 +            self.__ui.preset_pending = False
 +            self.__ui.preset_error = True
-+            self.__ui.preset_message = 'No matching video frame. Try Drive or Fast (Max detail may exceed the frame-size limit).'
++            self.__ui.preset_message = 'No matching video frame. Try Balanced, Drive or Fast.'
 +            self.__preset_wait = None
 +
 +    def __confirm_camera_frame(self, frame):
@@ -1374,10 +1768,12 @@ index 3269509..65045d3 100644
 +        if self.__video is not None:
 +            _, age = self.__video.latest()
 +            fresh = fresh and time.monotonic()-age > applied+.2
-+        if fresh and (frame.shape[1], frame.shape[0]) == PRESETS[key].size:
-+            self.__ui.preset = key
++        quality_only = key.startswith('quality:')
++        if fresh and (quality_only or (frame.shape[1], frame.shape[0]) == PRESETS[key].size):
++            self.__ui.preset = self.__requested_preset if quality_only else key
 +            self.__ui.preset_pending = False
-+            self.__ui.preset_message = PRESETS[key].name+' active. Release driving controls to continue; manual Stop, if set, still needs Resume.'
++            name = 'Adaptive JPEG '+key.split(':')[1] if quality_only else PRESETS[key].name
++            self.__ui.preset_message = name+' active. Release driving controls to continue; manual Stop, if set, still needs Resume.'
 +            self.__preset_wait = None
 +            self.__fps_sample = (time.monotonic(), self.__video.frames if self.__video else self.__http_frames)
 +            self.__ui.fps = None
@@ -1393,6 +1789,10 @@ index 3269509..65045d3 100644
 +        dashboard = getattr(self, "_GameEngine__dashboard", None)
 +        if dashboard is None:
 +            return
++        now = time.monotonic()
++        if now-getattr(self, '_GameEngine__render_at', -float('inf')) < 1/30:
++            return
++        self.__render_at = now
 +        ui = self.__ui
 +        pad = next((p for p in self.__joysticks.values() if p.attached()), None)
 +        ui.controller = pad.name if pad else 'No controller connected'
@@ -1463,7 +1863,7 @@ index 3269509..65045d3 100644
  
      def __handle_terminal_input(self) -> None:
          print("Options:")
-@@ -298,30 +781,64 @@ class GameEngine:
+@@ -298,30 +816,64 @@ class GameEngine:
              if self.__car.vision_tracking_is_on:
                  self.__car.toggle_vision_tracking()
          elif user_choice == 4:
@@ -1536,7 +1936,7 @@ index 3269509..65045d3 100644
      parser = argparse.ArgumentParser(
          description="Program for remotely controlling Elegoo Smart "
          "Robot Car v4.0"
-@@ -354,12 +871,27 @@ def main() -> None:
+@@ -354,12 +906,27 @@ def main() -> None:
          action="store_true",
          help="Print the version and exit.",
      )
@@ -1564,7 +1964,7 @@ index 3269509..65045d3 100644
      if not args.robot_ip:
          print("Specify a robot IP address!")
          exit(1)
-@@ -367,7 +899,7 @@ def main() -> None:
+@@ -367,7 +934,7 @@ def main() -> None:
      pg.init()
  
      with GameEngine(
@@ -1573,6 +1973,101 @@ index 3269509..65045d3 100644
      ) as engine:
          engine.run()
  
+diff --git a/src/elegoo_robot_car4/http_video.py b/src/elegoo_robot_car4/http_video.py
+new file mode 100644
+index 0000000..b669e11
+--- /dev/null
++++ b/src/elegoo_robot_car4/http_video.py
+@@ -0,0 +1,60 @@
++"""Independent HTTP capture worker for the dashboard's fallback transport."""
++import threading
++import time
++
++import cv2 as cv
++import numpy as np
++import requests
++
++
++class HttpVideo:
++    def __init__(self, host):
++        self.endpoint = f'http://{host}/capture'
++        self._stop = threading.Event()
++        self._lock = threading.Lock()
++        self._latest = None
++        self.frames = 0
++        self.error = None
++        self._thread = threading.Thread(target=self._run, name='http-video', daemon=True)
++        self._thread.start()
++
++    def _run(self):
++        with requests.Session() as session:
++            while not self._stop.is_set():
++                started = time.monotonic()
++                try:
++                    with session.get(self.endpoint, timeout=(1, .5), stream=True) as response:
++                        response.raise_for_status()
++                        data = bytearray()
++                        for chunk in response.iter_content(16384):
++                            if self._stop.is_set():
++                                return
++                            if time.monotonic()-started > .75 or len(data)+len(chunk) > 2*1024*1024:
++                                raise ValueError('HTTP frame exceeded freshness or size limit')
++                            data.extend(chunk)
++                    if not (data.startswith(b'\xff\xd8') and data.endswith(b'\xff\xd9')):
++                        raise ValueError('Incomplete HTTP JPEG')
++                    frame = cv.imdecode(np.frombuffer(data, np.uint8), cv.IMREAD_COLOR)
++                    if frame is not None and time.monotonic()-started <= .75:
++                        with self._lock:
++                            self._latest = (frame, started)
++                            self.frames += 1
++                        self.error = None
++                except (requests.RequestException, ValueError, cv.error) as exc:
++                    self.error = str(exc)
++                    self._stop.wait(.1)
++                self._stop.wait(max(0, 1/30-(time.monotonic()-started)))
++
++    def latest(self):
++        with self._lock:
++            if self._latest is None:
++                return None, float('inf')
++            frame, started = self._latest
++            return frame, time.monotonic()-started
++
++    def diagnostics(self):
++        return dict(completed=self.frames, error=self.error)
++
++    def close(self):
++        self._stop.set()
++        self._thread.join(timeout=.1)
+diff --git a/src/elegoo_robot_car4/optional_features.py b/src/elegoo_robot_car4/optional_features.py
+new file mode 100644
+index 0000000..e4c8286
+--- /dev/null
++++ b/src/elegoo_robot_car4/optional_features.py
+@@ -0,0 +1,23 @@
++"""Dependencies loaded only when an optional feature is explicitly requested."""
++
++
++def load_yolo(model_name):
++    try:
++        from ultralytics import YOLO
++    except ModuleNotFoundError as exc:
++        raise RuntimeError(
++            "Vision is unavailable. Install the 'vision' extra with "
++            "uv sync --extra vision (or pip install '.[vision]') in the repository."
++        ) from exc
++    return YOLO(model_name)
++
++
++def navigation_integrator():
++    try:
++        from scipy.integrate import trapezoid
++    except ModuleNotFoundError as exc:
++        raise RuntimeError(
++            "Gyro navigation is unavailable. Install the 'navigation' extra with "
++            "uv sync --extra navigation (or pip install '.[navigation]') in the repository."
++        ) from exc
++    return trapezoid
 diff --git a/src/elegoo_robot_car4/person_follower.py b/src/elegoo_robot_car4/person_follower.py
 index 6bcd4dc..f0935aa 100644
 --- a/src/elegoo_robot_car4/person_follower.py
@@ -1593,10 +2088,10 @@ index 6bcd4dc..f0935aa 100644
  
 diff --git a/src/elegoo_robot_car4/udp_video.py b/src/elegoo_robot_car4/udp_video.py
 new file mode 100644
-index 0000000..817f518
+index 0000000..15fc9ce
 --- /dev/null
 +++ b/src/elegoo_robot_car4/udp_video.py
-@@ -0,0 +1,144 @@
+@@ -0,0 +1,188 @@
 +"""Bounded, latest-frame-only JPEG-over-UDP receiver for the local camera firmware."""
 +import select
 +import secrets
@@ -1604,6 +2099,7 @@ index 0000000..817f518
 +import struct
 +import threading
 +import time
++import sys
 +
 +import cv2 as cv
 +import numpy as np
@@ -1611,6 +2107,8 @@ index 0000000..817f518
 +HEADER = struct.Struct('!4sIIIHH')
 +CHUNK = 1200
 +MAX_FRAME = 262144
++MAX_AGE = .75
++STATUS = struct.Struct('!4sIIIIII')
 +
 +
 +class FrameAssembler:
@@ -1647,6 +2145,7 @@ index 0000000..817f518
 +        if (sequence != self.sequence or self.finished or total != self.total
 +                or count != self.count):
 +            return None
++        self.started = min(self.started, now)
 +        if now - self.started > 0.25:
 +            self.expired_frames += 1
 +            self.parts.clear()
@@ -1673,6 +2172,14 @@ index 0000000..817f518
 +        self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024*1024)
 +        self.receive_buffer_bytes = self._socket.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
 +        self._socket.settimeout(0.05)
++        self._timestamp_option = None
++        if sys.platform == 'linux':
++            option = getattr(socket, 'SO_TIMESTAMPNS', 35)
++            try:
++                self._socket.setsockopt(socket.SOL_SOCKET, option, 1)
++                self._timestamp_option = option
++            except OSError:
++                pass
 +        self._socket.connect((host, port))  # filters packets and replies through same firewall tuple
 +        self._token = secrets.randbits(32)
 +        self._assembler = FrameAssembler(self._token)
@@ -1681,8 +2188,31 @@ index 0000000..817f518
 +        self._latest = None
 +        self.error = None
 +        self.frames = 0
++        self.stale_frames = 0
++        self.sender_status = None
 +        self._thread = threading.Thread(target=self._run, name='udp-video', daemon=True)
 +        self._thread.start()
++
++    def _receive(self):
++        if self._timestamp_option is None:
++            return self._socket.recv(HEADER.size+CHUNK+1), time.monotonic()
++        packet, ancillary, _, _ = self._socket.recvmsg(HEADER.size+CHUNK+1, socket.CMSG_SPACE(16))
++        received = time.monotonic()
++        for level, kind, data in ancillary:
++            if level == socket.SOL_SOCKET and kind == self._timestamp_option:
++                seconds, nanoseconds = struct.unpack('@ll', data[:struct.calcsize('@ll')])
++                received -= max(0, time.time()-(seconds+nanoseconds/1e9))
++        return packet, received
++
++    def _feed(self, packet, received):
++        if len(packet) == STATUS.size and packet[:4] == b'EVT1':
++            _, token, frames, oversized, failed, size, quality = STATUS.unpack(packet)
++            if token == self._token:
++                self.sender_status = dict(frames=frames, oversized=oversized,
++                                          failed=failed, bytes=size, quality=quality)
++            return None
++        jpeg = self._assembler.feed(packet, received)
++        return (jpeg, self._assembler.started) if jpeg is not None else None
 +
 +    def _run(self):
 +        renewed = 0.0
@@ -1692,23 +2222,30 @@ index 0000000..817f518
 +                if now - renewed >= 0.5:
 +                    self._socket.send(struct.pack('!4sI', b'EVS1', self._token))
 +                    renewed = now
-+                packet = self._socket.recv(HEADER.size + CHUNK + 1)
-+                jpeg = self._assembler.feed(packet, time.monotonic())
++                packet, received = self._receive()
++                candidate = self._feed(packet, received)
 +                # Drain already-arrived packets before decoding: drop superseded
 +                # complete frames instead of letting a decode queue build up.
 +                for _ in range(256):
 +                    if not select.select([self._socket], [], [], 0)[0]:
 +                        break
-+                    packet = self._socket.recv(HEADER.size + CHUNK + 1)
-+                    completed = self._assembler.feed(packet, time.monotonic())
++                    packet, received = self._receive()
++                    completed = self._feed(packet, received)
 +                    if completed is not None:
-+                        jpeg = completed
-+                if jpeg is None:
++                        candidate = completed
++                if candidate is None:
++                    continue
++                jpeg, received = candidate
++                if time.monotonic()-received > MAX_AGE:
++                    self.stale_frames += 1
 +                    continue
 +                frame = cv.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv.IMREAD_COLOR)
++                if time.monotonic()-received > MAX_AGE:
++                    self.stale_frames += 1
++                    continue
 +                if frame is not None:
 +                    with self._lock:
-+                        self._latest = (frame, time.monotonic())
++                        self._latest = (frame, received)
 +                        self.frames += 1
 +                    self.error = None
 +            except socket.timeout:
@@ -1730,7 +2267,9 @@ index 0000000..817f518
 +        a = self._assembler
 +        return dict(completed=a.completed_frames, incomplete=a.incomplete_frames,
 +                    expired=a.expired_frames, last_jpeg_bytes=a.last_frame_bytes,
-+                    receive_buffer_bytes=self.receive_buffer_bytes)
++                    receive_buffer_bytes=self.receive_buffer_bytes,
++                    stale=self.stale_frames, kernel_timestamps=self._timestamp_option is not None,
++                    sender=self.sender_status)
 +
 +    def close(self):
 +        self._stop.set()
@@ -1741,6 +2280,41 @@ index 0000000..817f518
 +            pass  # firmware subscription also expires after three seconds
 +        finally:
 +            self._socket.close()
+diff --git a/src/elegoo_robot_car4/video_adaptation.py b/src/elegoo_robot_car4/video_adaptation.py
+new file mode 100644
+index 0000000..697ea23
+--- /dev/null
++++ b/src/elegoo_robot_car4/video_adaptation.py
+@@ -0,0 +1,29 @@
++"""Bounded JPEG-quality reductions when detailed video exceeds its budget."""
++
++
++class VideoAdaptation:
++    def __init__(self):
++        self.last_check = 0.0
++        self.previous = None
++
++    def reset(self, now):
++        self.last_check = now
++        self.previous = None
++
++    def recommend(self, diagnostics, age, preset, quality, now):
++        if preset != 'detail' or quality is None or quality >= 40 or now-self.last_check < 5:
++            return None
++        self.last_check = now
++        sender = diagnostics.get('sender') or {}
++        counters = (diagnostics.get('completed', 0),
++                    diagnostics.get('incomplete', 0)+diagnostics.get('expired', 0),
++                    sender.get('oversized', 0), sender.get('failed', 0))
++        previous, self.previous = self.previous, counters
++        lost = False
++        if previous is not None:
++            complete, dropped, oversized, failed = [max(0, current-old) for current, old in zip(counters, previous)]
++            lost = oversized > 0 or failed > 0 or (complete+dropped >= 10 and dropped/(complete+dropped) > .2)
++        large = max(diagnostics.get('last_jpeg_bytes', 0), sender.get('bytes', 0)) > 220*1024
++        if lost or large or age > 2:
++            return min(40, quality+5)
++        return None
 diff --git a/tests/unit_tests/conftest.py b/tests/unit_tests/conftest.py
 index f1b4ca9..498abc0 100644
 --- a/tests/unit_tests/conftest.py
@@ -1761,6 +2335,322 @@ index f1b4ca9..498abc0 100644
          autospec=True,
          return_value=yolo_model_mock,
      )
+diff --git a/tests/unit_tests/test_active_timing.py b/tests/unit_tests/test_active_timing.py
+new file mode 100644
+index 0000000..28351a9
+--- /dev/null
++++ b/tests/unit_tests/test_active_timing.py
+@@ -0,0 +1,310 @@
++from threading import Event, Lock
++from unittest.mock import MagicMock
++import json
++import socket
++import struct
++import time
++
++import numpy as np
++import pytest
++
++from elegoo_robot_car4.car import Car
++from elegoo_robot_car4.connection import Connection
++from elegoo_robot_car4.udp_video import UdpVideo, FrameAssembler, HEADER, STATUS
++from elegoo_robot_car4.video_adaptation import VideoAdaptation
++from elegoo_robot_car4.camera_presets import apply_preset
++
++
++class RecordingCar:
++    vision_tracking_is_on = False
++
++    def __init__(self):
++        self.commands = []
++        self.updated = Event()
++        self.stopped_after_motion = Event()
++
++    def is_far_from_the_ground(self):
++        return False
++
++    def drive_analogue(self, left, right, head, latest=None):
++        demand = latest() if latest is not None else (left, right, head)
++        if demand[:2] == (0, 0) and any(command[0] for command in self.commands):
++            self.stopped_after_motion.set()
++        self.commands.append(demand)
++        if len(self.commands) >= 3:
++            self.updated.set()
++
++    def stop(self):
++        pass
++
++    def enable_analogue_drive(self):
++        pass
++
++    def cancel(self):
++        pass
++
++    def disconnect(self):
++        pass
++
++
++def cleanup(link):
++    link.close()
++    link.executor.shutdown(wait=True)
++
++
++def test_neutral_replaces_movement_during_delayed_ground_reply():
++    entered, release = Event(), Event()
++    link = Connection('unused', 'udp')
++    car = link.car = RecordingCar()
++    def ground():
++        entered.set()
++        assert release.wait(2)
++        return False
++    car.is_far_from_the_ground = ground
++    link.update_demand((150, 150, 0))
++    link.submit(lambda: link.exchange((150, 150, 0), latest=link.current_demand))
++    try:
++        assert entered.wait(2)
++        link.update_demand((0, 0, 0))
++        release.set()
++        link.pending.result(timeout=2)
++        assert car.commands == [(0, 0, 0)]
++    finally:
++        release.set()
++        cleanup(link)
++
++
++def test_control_refresh_is_independent_of_gui_and_expires_without_input():
++    link = Connection('unused', 'udp')
++    car = link.car = RecordingCar()
++    link.update_demand((100, 100, 0))
++    try:
++        link.start_control()
++        assert car.updated.wait(2)
++        assert len(car.commands) >= 3
++        assert car.stopped_after_motion.wait(2)
++        assert link.input_expired
++        link.update_demand((100, 100, 0))
++        assert link.current_demand() == (0, 0, 0)
++        link.update_demand((0, 0, 0))
++        link.update_demand((100, 100, 0))
++        assert link.current_demand() == (100, 100, 0)
++    finally:
++        cleanup(link)
++
++
++def test_latest_input_is_checked_after_uart_pacing(mocker):
++    car = Car(dry_run=True)
++    car._Car__dry_run = False
++    car._Car__analogue_ready = True
++    car._Car__socket = MagicMock()
++    car._Car__socket.recv.return_value = b'{d1_ok}'
++    current = [(100, 100, 0)]
++    def wait(_):
++        current[0] = (0, 0, 0)
++        return False
++    car._Car__cancel_event = MagicMock()
++    car._Car__cancel_event.wait.side_effect = wait
++    car._Car__cancel_event.is_set.return_value = False
++    car.drive_analogue(100, 100, 0, latest=lambda: current[0])
++    packet = json.loads(car._Car__socket.sendall.call_args.args[0])
++    assert packet['D1'] == packet['D2'] == 0
++    car.disconnect()
++
++
++def test_close_cancels_connection_initialization():
++    entered = Event()
++    def factory(**kwargs):
++        assert kwargs['initialize'] is False
++        entered.set()
++        assert kwargs['cancel_event'].wait(2)
++        raise ConnectionAbortedError('cancelled')
++    link = Connection('unused', 'udp', car_factory=factory)
++    link.submit(link.connect)
++    assert entered.wait(2)
++    link.close()
++    with pytest.raises(ConnectionAbortedError):
++        link.pending.result(timeout=1)
++    link.executor.shutdown(wait=True)
++
++
++def test_dashboard_connect_skips_calibration_and_head_command(mocker):
++    mocker.patch('elegoo_robot_car4.car.socket.socket')
++    calibration = mocker.patch.object(Car, '_Car__compute_mpu_offsets')
++    head = mocker.patch.object(Car, 'set_head_angle')
++    car = Car('unused', initialize=False, stop_before_init=True)
++    calibration.assert_not_called()
++    head.assert_not_called()
++    car.disconnect()
++
++
++def receiver():
++    video = UdpVideo.__new__(UdpVideo)
++    video._stop = Event()
++    video._lock = Lock()
++    video._socket = MagicMock()
++    video._token = 123
++    video._assembler = FrameAssembler(123)
++    video._latest = None
++    video.frames = video.stale_frames = 0
++    video.sender_status = None
++    return video
++
++
++def test_decode_delay_cannot_refresh_an_old_frame(mocker):
++    video = receiver()
++    now = [10.0]
++    packet = HEADER.pack(b'EVF1', 123, 1, 6, 0, 1)+b'\xff\xd8ok\xff\xd9'
++    mocker.patch.object(video, '_receive', return_value=(packet, 10.0))
++    mocker.patch('elegoo_robot_car4.udp_video.select.select', return_value=([], [], []))
++    mocker.patch('elegoo_robot_car4.udp_video.time.monotonic', side_effect=lambda: now[0])
++    def decode(*args):
++        now[0] = 11.0
++        video._stop.set()
++        return np.zeros((2, 2, 3), np.uint8)
++    mocker.patch('elegoo_robot_car4.udp_video.cv.imdecode', side_effect=decode)
++    video._run()
++    assert video.frames == 0 and video.stale_frames == 1
++    assert video.latest() == (None, float('inf'))
++
++
++def test_kernel_receive_timestamp_includes_socket_backlog(mocker):
++    video = receiver()
++    video._timestamp_option = 35
++    video._socket.recvmsg.return_value = (b'packet', [(socket.SOL_SOCKET, 35, struct.pack('@ll', 100, 0))], 0, None)
++    mocker.patch('elegoo_robot_car4.udp_video.time.time', return_value=101.0)
++    mocker.patch('elegoo_robot_car4.udp_video.time.monotonic', return_value=50.0)
++    assert video._receive() == (b'packet', 49.0)
++
++
++def test_sender_counters_require_matching_subscription():
++    video = receiver()
++    video._feed(STATUS.pack(b'EVT1', 456, 10, 2, 3, 280000, 10), 0)
++    assert video.sender_status is None
++    video._feed(STATUS.pack(b'EVT1', 123, 10, 2, 3, 280000, 10), 0)
++    assert video.sender_status['oversized'] == 2
++    assert video.sender_status['failed'] == 3
++
++
++def test_adaptation_is_bounded_and_keeps_driving_presets():
++    adaptation = VideoAdaptation()
++    assert adaptation.recommend({}, 3, 'fast', 20, 10) is None
++    assert adaptation.recommend({}, 3, 'drive', 15, 10) is None
++    assert adaptation.recommend({}, 3, 'balanced', 10, 10) is None
++    assert adaptation.recommend({}, 3, 'detail', 10, 10) == 15
++    assert adaptation.recommend({}, 3, 'detail', 15, 11) is None
++    assert adaptation.recommend({}, .1, 'detail', 15, 15) is None
++    assert adaptation.recommend({'last_jpeg_bytes': 240000}, .1, 'detail', 35, 20) == 40
++    assert adaptation.recommend({}, 3, 'detail', 40, 30) is None
++
++
++def test_quality_adaptation_does_not_change_resolution():
++    get = MagicMock()
++    get.return_value.json.return_value = dict(quality=20, framesize=13)
++    apply_preset('unused', 'quality:20', get)
++    assert get.call_count == 2
++    assert get.call_args_list[0].kwargs['params'] == {'var': 'quality', 'val': 20}
++
++
++def test_cancelled_preset_does_not_send_remaining_camera_writes():
++    cancel = Event()
++    get = MagicMock()
++    def first(*args, **kwargs):
++        cancel.set()
++        return MagicMock()
++    get.side_effect = first
++    with pytest.raises(ValueError, match='cancelled'):
++        apply_preset('unused', 'detail', get, cancel)
++    assert get.call_count == 1
++
++
++def test_slow_http_capture_does_not_block_control(mocker):
++    from elegoo_robot_car4.http_video import HttpVideo
++    entered, release = Event(), Event()
++    session = mocker.patch('elegoo_robot_car4.http_video.requests.Session').return_value.__enter__.return_value
++    def get(*args, **kwargs):
++        entered.set()
++        assert release.wait(2)
++        raise ValueError('delayed capture')
++    session.get.side_effect = get
++    video = HttpVideo('unused')
++    link = Connection('unused', 'http')
++    car = link.car = RecordingCar()
++    try:
++        assert entered.wait(2)
++        link.update_demand((0, 0, 0))
++        link.start_control()
++        assert car.updated.wait(1)
++        assert len(car.commands) >= 3
++    finally:
++        video.close()
++        release.set()
++        video._thread.join(2)
++        cleanup(link)
++
++
++@pytest.mark.parametrize('stop_action', ['neutral', 'both', 'stop'])
++def test_active_dashboard_replaces_pending_drive_before_sensor_reply(monkeypatch, mocker, stop_action):
++    import pygame as pg
++    from elegoo_robot_car4.elegoo_smartcar_control import GameEngine
++    monkeypatch.setenv('SDL_VIDEODRIVER', 'dummy')
++    monkeypatch.setenv('SDL_AUDIODRIVER', 'dummy')
++    pg.init()
++    car = RecordingCar()
++    entered, release = Event(), Event()
++    blocked = [False]
++    sent_before_release = [None]
++    def ground():
++        if any(command[0] for command in car.commands) and not blocked[0]:
++            blocked[0] = True
++            entered.set()
++            assert release.wait(2)
++            sent_before_release[0] = len(car.commands)
++        return False
++    car.is_far_from_the_ground = ground
++    mocker.patch('elegoo_robot_car4.elegoo_smartcar_control.Car', return_value=car)
++    video = mocker.patch('elegoo_robot_car4.elegoo_smartcar_control.UdpVideo').return_value
++    video.latest.side_effect = lambda: (np.zeros((600, 800, 3), np.uint8), .02)
++    video.frames = 1
++    apply = mocker.patch('elegoo_robot_car4.camera_presets.apply_preset')
++    mocker.patch('pygame.key.get_focused', return_value=True)
++    mocker.patch.object(GameEngine, '_GameEngine__render_dashboard')
++    axes = {}
++    pad = MagicMock()
++    pad.attached.return_value = True
++    pad.get_button.return_value = False
++    pad.get_axis.side_effect = lambda axis: axes.get(axis, 0)
++    phase = ['ready']
++    started = time.monotonic()
++    try:
++        with GameEngine('unused', video='udp', analogue_drive=True) as engine:
++            engine._GameEngine__joysticks = {1: pad}
++            def events():
++                assert time.monotonic()-started < 3
++                if phase[0] == 'ready' and engine._GameEngine__ui.status == 'Ready':
++                    assert engine._GameEngine__ui.preset == 'balanced'
++                    assert not engine._GameEngine__ui.preset_pending
++                    assert apply.call_args.args[1] == 'balanced'
++                    axes[pg.CONTROLLER_AXIS_TRIGGERRIGHT] = 32767
++                    phase[0] = 'driving'
++                if phase[0] == 'driving' and entered.is_set():
++                    phase[0] = 'stopping'
++                    if stop_action == 'both':
++                        axes[pg.CONTROLLER_AXIS_TRIGGERLEFT] = 32767
++                    else:
++                        axes.clear()
++                    if stop_action == 'stop':
++                        return [pg.event.Event(pg.KEYDOWN, key=pg.K_SPACE)]
++                elif phase[0] == 'stopping':
++                    phase[0] = 'released'
++                    release.set()
++                if sent_before_release[0] is not None and len(car.commands) > sent_before_release[0]:
++                    return [pg.event.Event(pg.QUIT)]
++                return []
++            mocker.patch('pygame.event.get', side_effect=events)
++            engine.run()
++            assert any(command[0] for command in car.commands)
++            assert all(command[:2] == (0, 0) for command in car.commands[sent_before_release[0]:])
++    finally:
++        release.set()
++        pg.quit()
 diff --git a/tests/unit_tests/test_analogue_drive.py b/tests/unit_tests/test_analogue_drive.py
 new file mode 100644
 index 0000000..fa46928
@@ -2183,6 +3073,223 @@ index 0000000..79bf990
 +    engine._GameEngine__video = MagicMock()
 +    engine.release_resources()
 +    engine._GameEngine__video.close.assert_called_once()
+diff --git a/tests/unit_tests/test_camera_presets.py b/tests/unit_tests/test_camera_presets.py
+new file mode 100644
+index 0000000..e68d793
+--- /dev/null
++++ b/tests/unit_tests/test_camera_presets.py
+@@ -0,0 +1,211 @@
++from unittest.mock import MagicMock
++import numpy as np
++import pygame as pg
++import pytest
++import requests
++from elegoo_robot_car4.camera_presets import PRESETS, apply_preset, CameraSettings
++from elegoo_robot_car4.dashboard import Dashboard, DashboardState
++from elegoo_robot_car4.elegoo_smartcar_control import GameEngine
++from elegoo_robot_car4.analogue_drive import AnalogueDrive
++
++
++@pytest.mark.parametrize('key,size,q,enum', [('fast',(320,240),20,5), ('drive',(640,480),15,8),
++                                           ('detail',(1024,768),10,10), ('balanced',(800,600),10,9)])
++def test_presets_write_expected_legacy_firmware_values_and_readback(key,size,q,enum):
++    get=MagicMock()
++    get.return_value.json.return_value={'quality':q,'framesize':enum}
++    apply_preset('car.test',key,get)
++    assert PRESETS[key].size == size
++    assert get.call_args_list[0].kwargs['params']=={'var':'quality','val':q}
++    assert get.call_args_list[1].kwargs['params']=={'var':'framesize','val':enum}
++    assert get.call_args_list[2].args==('http://car.test/status',)
++    assert all(c.kwargs['timeout']==(2,3) for c in get.call_args_list)
++
++
++@pytest.mark.parametrize('status',[{'quality':10,'framesize':8},[],{}])
++def test_mismatched_or_invalid_readback_is_failure(status):
++    get=MagicMock();get.return_value.json.return_value=status
++    with pytest.raises(ValueError):apply_preset('car.test','balanced',get)
++
++
++def test_http_failure_stops_remaining_setting_requests():
++    get=MagicMock();get.return_value.raise_for_status.side_effect=requests.HTTPError()
++    with pytest.raises(requests.HTTPError):apply_preset('car.test','balanced',get)
++    assert get.call_count==1
++
++
++def engine():
++    e=GameEngine.__new__(GameEngine)
++    e._GameEngine__ui=DashboardState()
++    e._GameEngine__car=MagicMock()
++    e._GameEngine__analogue=AnalogueDrive(left=100,right=100)
++    e._GameEngine__camera_settings=MagicMock()
++    e._GameEngine__camera_settings.start.return_value=True
++    e._GameEngine__camera_settings.poll.return_value=None
++    e._GameEngine__stop_held=False
++    e._GameEngine__preset_wait=None
++    e._GameEngine__last_raw_frame=None
++    e._GameEngine__video=None
++    e._GameEngine__http_frames=0
++    return e
++
++
++def test_preset_selection_stops_before_request_and_disallows_duplicate():
++    e=engine();events=[]
++    e._GameEngine__car.stop.side_effect=lambda:events.append('stop')
++    e._GameEngine__camera_settings.start.side_effect=lambda k:events.append(k) or True
++    e._GameEngine__select_camera_preset('balanced')
++    assert events==['stop','balanced']
++    assert not e._GameEngine__stop_held and e._GameEngine__neutral_required
++    assert e._GameEngine__ui.preset_pending and not e._GameEngine__ui.stopped
++    assert e._GameEngine__analogue.left==0
++    e._GameEngine__select_camera_preset('drive')
++    assert events==['stop','balanced']
++
++
++def test_failed_stop_does_not_change_camera():
++    e=engine();e._GameEngine__car.stop.side_effect=TimeoutError()
++    e._GameEngine__select_camera_preset('balanced')
++    e._GameEngine__camera_settings.start.assert_not_called()
++    assert e._GameEngine__ui.preset_error and not e._GameEngine__ui.preset_pending
++    assert not e._GameEngine__stop_held and e._GameEngine__neutral_required
++
++
++def test_http_success_waits_for_fresh_matching_frame(mocker):
++    e=engine();e._GameEngine__ui.preset_pending=True
++    e._GameEngine__camera_settings.poll.return_value=('balanced',None)
++    now=mocker.patch('elegoo_robot_car4.elegoo_smartcar_control.time.monotonic',return_value=10)
++    e._GameEngine__poll_camera_settings()
++    frame=np.zeros((600,800,3),dtype=np.uint8)
++    e._GameEngine__confirm_camera_frame(frame)
++    assert e._GameEngine__ui.preset_pending
++    now.return_value=11
++    e._GameEngine__confirm_camera_frame(np.zeros((480,640,3),dtype=np.uint8))
++    assert e._GameEngine__ui.preset_pending
++    e._GameEngine__last_raw_frame=frame
++    e._GameEngine__confirm_camera_frame(frame)
++    assert e._GameEngine__ui.preset_pending
++    e._GameEngine__last_raw_frame=None
++    e._GameEngine__confirm_camera_frame(frame)
++    assert not e._GameEngine__ui.preset_pending and e._GameEngine__ui.preset=='balanced'
++
++
++def test_no_matching_video_times_out_and_allows_lower_preset(mocker):
++    e=engine();e._GameEngine__ui.preset_pending=True
++    e._GameEngine__preset_wait=('balanced',10,18)
++    mocker.patch('elegoo_robot_car4.elegoo_smartcar_control.time.monotonic',return_value=19)
++    e._GameEngine__poll_camera_settings()
++    assert e._GameEngine__ui.preset_error and not e._GameEngine__ui.preset_pending
++    e._GameEngine__select_camera_preset('drive')
++    e._GameEngine__camera_settings.start.assert_called_once_with('drive')
++
++
++def test_worker_serializes_requests_and_surfaces_errors(mocker):
++    thread=mocker.patch('elegoo_robot_car4.camera_presets.Thread')
++    apply=mocker.patch('elegoo_robot_car4.camera_presets.apply_preset',side_effect=requests.Timeout('offline'))
++    settings=CameraSettings('car.test')
++    assert settings.start('balanced')
++    assert not settings.start('fast')
++    assert settings.poll() is None
++    thread.call_args.kwargs['target']()
++    key,error=settings.poll()
++    assert key=='balanced' and 'Timeout' in error
++    assert not settings.busy
++    apply.assert_called_once_with('car.test','balanced',settings._session.get,settings._cancel)
++
++
++def test_pending_preset_blocks_resume_even_after_zero_ack(mocker):
++    e=engine();e._GameEngine__dry_run=False
++    e._GameEngine__stop_held=True;e._GameEngine__resume_requested=True
++    e._GameEngine__ui.preset_pending=True
++    pad=MagicMock();pad.attached.return_value=True;pad.get_axis.return_value=0
++    e._GameEngine__joysticks={1:pad}
++    mocker.patch('pygame.key.get_focused',return_value=True)
++    e._GameEngine__handle_analogue_actions()
++    assert e._GameEngine__stop_held and not e._GameEngine__ui.can_resume
++    e._GameEngine__car.drive_analogue.assert_called_once_with(0,0,0)
++
++
++def test_preset_hitboxes_after_resize(monkeypatch):
++    monkeypatch.setenv('SDL_VIDEODRIVER','dummy');monkeypatch.setenv('SDL_AUDIODRIVER','dummy')
++    pg.init()
++    try:
++        d=Dashboard(preview=True)
++        d.action(pg.event.Event(pg.VIDEORESIZE,w=960,h=720))
++        for key,rect in d.PRESET_RECTS.items():
++            point=tuple(round(p*d.scale+o) for p,o in zip(rect.center,d.offset))
++            assert d.action(pg.event.Event(pg.MOUSEBUTTONDOWN,button=1,pos=point))=='preset:'+key
++        d.draw(DashboardState(preset='balanced',preset_message='Balanced active.'),1)
++    finally:pg.quit()
++
++
++
++def test_standalone_preset_reuses_one_session_for_all_requests(mocker):
++    session=mocker.patch('elegoo_robot_car4.camera_presets.requests.Session').return_value.__enter__.return_value
++    session.get.return_value.json.return_value={'quality':10,'framesize':9}
++    apply_preset('car.test','balanced')
++    assert session.get.call_count==3
++    assert session.get.return_value.close.call_count==3
++
++
++def test_worker_reuses_session_across_preset_selections_and_closes(mocker):
++    session=mocker.patch('elegoo_robot_car4.camera_presets.requests.Session').return_value
++    thread=mocker.patch('elegoo_robot_car4.camera_presets.Thread')
++    apply=mocker.patch('elegoo_robot_car4.camera_presets.apply_preset')
++    settings=CameraSettings('car.test')
++    for key in ['fast','balanced','drive']:
++        assert settings.start(key)
++        thread.call_args.kwargs['target']()
++        assert settings.poll()==(key,None)
++        apply.assert_called_with('car.test',key,session.get,settings._cancel)
++    session.close.assert_not_called()
++    settings.close()
++    session.close.assert_called_once()
++    assert not settings.start('balanced')
++
++
++def test_close_during_worker_defers_session_cleanup(mocker):
++    session=mocker.patch('elegoo_robot_car4.camera_presets.requests.Session').return_value
++    thread=mocker.patch('elegoo_robot_car4.camera_presets.Thread')
++    mocker.patch('elegoo_robot_car4.camera_presets.apply_preset')
++    settings=CameraSettings('car.test')
++    assert settings.start('fast')
++    settings.close()
++    session.close.assert_not_called()
++    thread.call_args.kwargs['target']()
++    session.close.assert_called_once()
++    assert not settings.start('drive')
++
++
++
++def test_preset_recovers_without_resume_but_never_replays_held_throttle(mocker):
++    e=engine();e._GameEngine__dry_run=False
++    axes={pg.CONTROLLER_AXIS_TRIGGERRIGHT:32767}
++    pad=MagicMock();pad.attached.return_value=True;pad.get_button.return_value=False
++    pad.get_axis.side_effect=lambda a:axes.get(a,0)
++    e._GameEngine__joysticks={1:pad}
++    mocker.patch('pygame.key.get_focused',return_value=True)
++    mocker.patch('pygame.display.set_caption')
++    e._GameEngine__select_camera_preset('balanced')
++    axes.clear()
++    e._GameEngine__handle_analogue_actions()
++    assert e._GameEngine__neutral_required and not e._GameEngine__stop_held
++    assert e._GameEngine__ui.status=='Changing camera'
++    e._GameEngine__ui.preset_pending=False
++    axes[pg.CONTROLLER_AXIS_TRIGGERRIGHT]=32767
++    e._GameEngine__handle_analogue_actions()
++    assert e._GameEngine__neutral_required
++    axes.clear()
++    e._GameEngine__handle_analogue_actions()
++    assert not e._GameEngine__neutral_required
++    assert e._GameEngine__ui.status=='Ready'
++    assert all(c.args[:2]==(0,0) for c in e._GameEngine__car.drive_analogue.call_args_list)
++    axes[pg.CONTROLLER_AXIS_TRIGGERRIGHT]=32767
++    e._GameEngine__handle_analogue_actions()
++    assert e._GameEngine__car.drive_analogue.call_args.args[0]>0
++
++
++def test_preset_does_not_clear_an_explicit_manual_stop():
++    e=engine();e._GameEngine__stop_held=True;e._GameEngine__ui.stopped=True
++    e._GameEngine__select_camera_preset('drive')
++    assert e._GameEngine__stop_held and e._GameEngine__ui.stopped
 diff --git a/tests/unit_tests/test_car.py b/tests/unit_tests/test_car.py
 index b101f11..2ee7d76 100644
 --- a/tests/unit_tests/test_car.py
@@ -2203,12 +3310,145 @@ index b101f11..2ee7d76 100644
      # given
      angle: int = 30  # turn by 30 degrees, counterclockwise
      get_mpu_data_mock = car_mocks["get_mpu_data"]
+diff --git a/tests/unit_tests/test_connection.py b/tests/unit_tests/test_connection.py
+new file mode 100644
+index 0000000..910d78a
+--- /dev/null
++++ b/tests/unit_tests/test_connection.py
+@@ -0,0 +1,127 @@
++"""Reconnect I/O checks without connecting to hardware."""
++from concurrent.futures import Future
++from threading import Event
++from unittest.mock import MagicMock
++
++from elegoo_robot_car4.connection import Connection
++
++
++class ImmediateExecutor:
++    def submit(self, function, *args):
++        result = Future()
++        try:
++            result.set_result(function(*args))
++        except Exception as exc:
++            result.set_exception(exc)
++        return result
++
++    def shutdown(self, **kwargs):
++        pass
++
++
++class SteppedConnection(Connection):
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        self.controlling = False
++
++    def start_control(self):
++        self.controlling = True
++
++    def poll(self):
++        if not self.controlling:
++            return super().poll()
++        if self._cancel.is_set():
++            self.controlling = False
++            return True, None
++        try:
++            return True, self.exchange(self.current_demand(), latest=self.current_demand)
++        except Exception as exc:
++            self.controlling = False
++            return False, exc
++
++
++def test_connect_replaces_socket_handshake_video_and_starts_zero():
++    first, second = MagicMock(), MagicMock()
++    factory = MagicMock(side_effect=[first, second])
++    videos = MagicMock()
++    link = Connection('test.invalid', 'udp', car_factory=factory, video_factory=videos)
++    link.connect()
++    video1 = link.video
++    link.connect()
++    first.stop.assert_called_once()
++    first.disconnect.assert_called_once()
++    video1.close.assert_called_once()
++    second.enable_analogue_drive.assert_called_once()
++    second.drive_analogue.assert_called_once_with(0, 0, 0)
++    assert factory.call_args.kwargs['stop_before_init']
++    link.close()
++    link.executor.shutdown(wait=True)
++
++
++def test_handshake_failure_closes_partial_connection():
++    car = MagicMock()
++    car.enable_analogue_drive.side_effect = TimeoutError('no firmware reply')
++    link = Connection('test.invalid', 'udp', car_factory=MagicMock(return_value=car))
++    link.submit(link.connect)
++    link.executor.shutdown(wait=True)
++    success, error = link.poll()
++    assert not success and isinstance(error, TimeoutError)
++    car.disconnect.assert_called_once()
++    assert link.car is None and link.video is None
++
++
++def test_slow_io_does_not_block_poll_or_queue_more_demands():
++    entered, release = Event(), Event()
++    def slow():
++        entered.set()
++        assert release.wait(5)
++        return 'done'
++    link = Connection('test.invalid', 'udp')
++    try:
++        assert link.submit(slow)
++        assert entered.wait(2)
++        assert link.poll() is None
++        assert not link.submit(lambda: 'stale motor command')
++    finally:
++        release.set()
++        link.executor.shutdown(wait=True)
++    assert link.poll() == (True, 'done')
++    assert link.poll() is None
++
++
++def test_raised_car_overrides_moving_demand():
++    link = Connection('test.invalid', 'udp')
++    link.car = MagicMock()
++    link.car.is_far_from_the_ground.return_value = True
++    raised, demand, _, _, frame = link.exchange((100, -100, 20))
++    assert raised and demand == (0, 0, 20) and frame is None
++    link.car.drive_analogue.assert_called_once_with(0, 0, 20)
++    link.close()
++    link.executor.shutdown(wait=True)
++
++
++def test_stop_during_sensor_query_cancels_unsent_motor_demand():
++    link = Connection('test.invalid', 'udp')
++    link.car = MagicMock()
++    generation = link.generation
++    def ground():
++        link.invalidate()  # UI requests Stop while the sensor call is pending.
++        return False
++    link.car.is_far_from_the_ground.side_effect = ground
++    link.exchange((180, 180, 0), generation)
++    link.car.drive_analogue.assert_called_once_with(0, 0, 0)
++    link.close()
++    link.executor.shutdown(wait=True)
++
++
++def test_failed_car_initialization_closes_socket_before_retry(mocker):
++    from elegoo_robot_car4.car import Car
++    socket = mocker.patch('elegoo_robot_car4.car.socket.socket').return_value
++    stop = mocker.patch.object(Car, 'stop')
++    calibration = mocker.patch.object(Car, '_Car__compute_mpu_offsets', side_effect=TimeoutError('IMU'))
++    import pytest
++    with pytest.raises(TimeoutError):
++        Car('test.invalid', stop_before_init=True)
++    stop.assert_called_once()
++    calibration.assert_called_once()
++    socket.close.assert_called_once()
 diff --git a/tests/unit_tests/test_dashboard.py b/tests/unit_tests/test_dashboard.py
 new file mode 100644
-index 0000000..976cf07
+index 0000000..97fe9ba
 --- /dev/null
 +++ b/tests/unit_tests/test_dashboard.py
-@@ -0,0 +1,268 @@
+@@ -0,0 +1,362 @@
 +"""Dashboard input and interlock checks; all robot calls are mocked."""
 +from unittest.mock import MagicMock
 +import pygame as pg
@@ -2352,6 +3592,17 @@ index 0000000..976cf07
 +    assert Dashboard.pan_label(-35) == '35 deg right'
 +
 +
++def immediate_camera_settings(mocker):
++    """Acknowledge camera writes deterministically without real HTTP requests."""
++    settings = mocker.patch('elegoo_robot_car4.elegoo_smartcar_control.CameraSettings').return_value
++    settings.busy = False
++    settings.quality = 10
++    results = []
++    settings.start.side_effect = lambda key: results.append((key, None)) or True
++    settings.poll.side_effect = lambda: results.pop(0) if results else None
++    return settings
++
++
 +def test_actual_dashboard_loop_uses_cached_udp_frame_and_stop_resume(dashboard, mocker):
 +    import numpy as np
 +    car = mocker.patch('elegoo_robot_car4.elegoo_smartcar_control.Car').return_value
@@ -2361,9 +3612,13 @@ index 0000000..976cf07
 +    video.latest.return_value = (np.zeros((600, 800, 3), dtype=np.uint8), .02)
 +    video.frames = 1
 +    mocker.patch('pygame.key.get_focused', return_value=True)
-+    mocker.patch('pygame.time.Clock')
-+    from tests.unit_tests.test_connection import ImmediateExecutor
++    immediate_camera_settings(mocker)
++    now = [100.0]
++    mocker.patch('time.monotonic', side_effect=lambda: now[0])
++    mocker.patch('pygame.time.Clock').return_value.tick.side_effect = lambda *_: now.__setitem__(0, now[0]+.1)
++    from tests.unit_tests.test_connection import ImmediateExecutor, SteppedConnection
 +    mocker.patch('elegoo_robot_car4.connection.ThreadPoolExecutor', return_value=ImmediateExecutor())
++    mocker.patch('elegoo_robot_car4.elegoo_smartcar_control.Connection', SteppedConnection)
 +    with GameEngine('test.invalid', video='udp', analogue_drive=True) as e:
 +        pad = MagicMock()
 +        pad.name = 'Test controller'
@@ -2374,17 +3629,92 @@ index 0000000..976cf07
 +        view = e._GameEngine__dashboard
 +        render_frame = mocker.spy(view, 'set_frame')
 +        point = tuple(round(p*view.scale+o) for p,o in zip(view.RESUME.center, view.offset))
-+        mocker.patch('pygame.event.get', side_effect=[[], [], [], [pg.event.Event(pg.KEYDOWN, key=pg.K_SPACE)],
-+                    [], [pg.event.Event(pg.MOUSEBUTTONDOWN, button=1, pos=point)], [], [pg.event.Event(pg.QUIT)]])
++        ticks = [0]
++        cached_calls = []
++        def events():
++            ticks[0] += 1
++            tick = ticks[0]
++            if tick <= 7:
++                video.latest.return_value = (np.zeros((600, 800, 3), dtype=np.uint8), .02)
++            if tick == 8:
++                assert e._GameEngine__ui.preset == 'balanced'
++                cached_calls.append(render_frame.call_count)
++            if tick == 10:
++                return [pg.event.Event(pg.KEYDOWN, key=pg.K_SPACE)]
++            if tick == 12:
++                return [pg.event.Event(pg.MOUSEBUTTONDOWN, button=1, pos=point)]
++            return [pg.event.Event(pg.QUIT)] if tick == 14 else []
++        mocker.patch('pygame.event.get', side_effect=events)
 +        e.run()
 +        assert e._GameEngine__ui.status == 'Ready'
 +        assert not e._GameEngine__stop_held
-+        render_frame.assert_called_once()  # repeated polls do not rescale old video
++        assert render_frame.call_count == cached_calls[0]
 +        assert view.frame_size == (800, 600)
 +        assert all(call.args[:2] == (0, 0) for call in car.drive_analogue.call_args_list)
 +        car.capture.assert_not_called()
 +    video.close.assert_called_once()
 +    car.disconnect.assert_called_once()
++
++
++def test_active_preset_waits_for_zero_and_preserves_manual_stop(dashboard, mocker):
++    import numpy as np
++    from tests.unit_tests.test_connection import ImmediateExecutor, SteppedConnection
++    car = mocker.patch('elegoo_robot_car4.elegoo_smartcar_control.Car').return_value
++    car.vision_tracking_is_on = False
++    car.is_far_from_the_ground.return_value = False
++    video = mocker.patch('elegoo_robot_car4.elegoo_smartcar_control.UdpVideo').return_value
++    video.frames = 1
++    settings = mocker.patch('elegoo_robot_car4.elegoo_smartcar_control.CameraSettings').return_value
++    settings.busy = False
++    settings.quality = 10
++    results = []
++    applied_at = []
++    def start(key):
++        assert car.drive_analogue.call_args.args[:2] == (0, 0)
++        applied_at.append(len(car.drive_analogue.call_args_list))
++        results.append((key, None))
++        return True
++    settings.start.side_effect = start
++    settings.poll.side_effect = lambda: results.pop(0) if results else None
++    mocker.patch('elegoo_robot_car4.connection.ThreadPoolExecutor', return_value=ImmediateExecutor())
++    mocker.patch('elegoo_robot_car4.elegoo_smartcar_control.Connection', SteppedConnection)
++    mocker.patch('pygame.key.get_focused', return_value=True)
++    now = [100.0]
++    mocker.patch('time.monotonic', side_effect=lambda: now[0])
++    mocker.patch('pygame.time.Clock').return_value.tick.side_effect = lambda *_: now.__setitem__(0, now[0]+.1)
++    with GameEngine('unused', video='udp', analogue_drive=True) as engine:
++        pad = MagicMock()
++        pad.attached.return_value = True
++        pad.get_button.return_value = False
++        axes = {}
++        pad.get_axis.side_effect = lambda axis: axes.get(axis, 0)
++        engine._GameEngine__joysticks = {1: pad}
++        ticks = [0]
++        def events():
++            ticks[0] += 1
++            tick = ticks[0]
++            shape = (768, 1024, 3) if tick >= 14 else (600, 800, 3)
++            video.latest.return_value = (np.zeros(shape, np.uint8), .02)
++            if tick == 7:
++                axes[pg.CONTROLLER_AXIS_TRIGGERRIGHT] = 32767
++            if tick == 12:
++                view = engine._GameEngine__dashboard
++                point = tuple(round(pos*view.scale+offset) for pos, offset in zip(view.PRESET_RECTS['detail'].center, view.offset))
++                return [pg.event.Event(pg.MOUSEBUTTONDOWN, button=1, pos=point)]
++            if tick == 14:
++                return [pg.event.Event(pg.KEYDOWN, key=pg.K_SPACE)]
++            if tick == 20:
++                assert engine._GameEngine__ui.preset == 'detail'
++                assert engine._GameEngine__stop_held
++                axes.clear()
++            if tick == 24:
++                assert engine._GameEngine__ui.can_resume
++                return [pg.event.Event(pg.QUIT)]
++            return []
++        mocker.patch('pygame.event.get', side_effect=events)
++        engine.run()
++        assert len(applied_at) == 2
++        assert all(call.args[:2] == (0, 0) for call in car.drive_analogue.call_args_list[applied_at[1]:])
 +
 +
 +def test_preview_cli_does_not_construct_robot(mocker):
@@ -2418,16 +3748,18 @@ index 0000000..976cf07
 +@pytest.mark.parametrize('reconnect_button', [False, True])
 +def test_reboot_retries_without_replaying_held_trigger(dashboard, mocker, manual_stop, reconnect_button):
 +    import numpy as np
-+    from tests.unit_tests.test_connection import ImmediateExecutor
++    from tests.unit_tests.test_connection import ImmediateExecutor, SteppedConnection
 +    car1, car2 = MagicMock(), MagicMock()
 +    for car in (car1, car2):
 +        car.vision_tracking_is_on = False
 +        car.is_far_from_the_ground.return_value = False
 +    factory = mocker.patch('elegoo_robot_car4.elegoo_smartcar_control.Car', side_effect=[car1, TimeoutError('booting'), car2])
 +    video = mocker.patch('elegoo_robot_car4.elegoo_smartcar_control.UdpVideo').return_value
-+    video.latest.return_value = (np.zeros((600, 800, 3), dtype=np.uint8), .02)
++    video.latest.side_effect = lambda: (np.zeros((600, 800, 3), dtype=np.uint8), .02)
++    settings = immediate_camera_settings(mocker)
 +    video.frames = 1
 +    mocker.patch('elegoo_robot_car4.connection.ThreadPoolExecutor', return_value=ImmediateExecutor())
++    mocker.patch('elegoo_robot_car4.elegoo_smartcar_control.Connection', SteppedConnection)
 +    mocker.patch('pygame.key.get_focused', return_value=True)
 +    now = [100.0]
 +    mocker.patch('time.monotonic', side_effect=lambda: now[0])
@@ -2444,9 +3776,9 @@ index 0000000..976cf07
 +        def events():
 +            ticks[0] += 1
 +            tick = ticks[0]
-+            if tick == 5:
++            if tick == 7:
 +                held[0] = True
-+            if tick == 8:
++            if tick == 12:
 +                # Break the old TCP connection after some successful driving.
 +                actions = [pg.event.Event(pg.KEYDOWN, key=pg.K_SPACE)] if manual_stop else []
 +                if reconnect_button:
@@ -2477,6 +3809,8 @@ index 0000000..976cf07
 +        assert any(c.args[0] > 0 for c in car1.drive_analogue.call_args_list)
 +        assert any(c.args[0] > 0 for c in car2.drive_analogue.call_args_list)
 +        assert not e._GameEngine__stop_held
++        assert e._GameEngine__ui.preset == 'balanced'
++        assert settings.start.call_count == 2
 diff --git a/tests/unit_tests/test_gamepad.py b/tests/unit_tests/test_gamepad.py
 new file mode 100644
 index 0000000..b1fcca0
@@ -2576,6 +3910,107 @@ index 0000000..b1fcca0
 +                                        pg.event.Event(pg.JOYDEVICEREMOVED,instance_id=999)])
 +    assert not e._GameEngine__handle_controller_player_actions()
 +    p.quit.assert_called_once()
+diff --git a/tests/unit_tests/test_optional_features.py b/tests/unit_tests/test_optional_features.py
+new file mode 100644
+index 0000000..ecf3922
+--- /dev/null
++++ b/tests/unit_tests/test_optional_features.py
+@@ -0,0 +1,95 @@
++import subprocess
++import sys
++from types import ModuleType
++from unittest.mock import MagicMock
++
++import pytest
++
++from elegoo_robot_car4 import Car
++from elegoo_robot_car4 import elegoo_smartcar_control as controller
++
++
++def test_default_imports_work_when_optional_dependencies_are_blocked():
++    script = """
++import importlib.abc
++import sys
++
++class BlockOptional(importlib.abc.MetaPathFinder):
++    def find_spec(self, fullname, path=None, target=None):
++        if fullname.split('.')[0] in {'torch', 'torchvision', 'ultralytics', 'lap', 'scipy', 'pandas', 'matplotlib', 'seaborn'}:
++            raise AssertionError('Default startup imported '+fullname)
++
++sys.meta_path.insert(0, BlockOptional())
++from elegoo_robot_car4.elegoo_smartcar_control import main
++assert 'elegoo_robot_car4.person_follower' not in sys.modules
++sys.argv = ['elegoo-smartcar-control', '--version']
++main()
++"""
++    result = subprocess.run([sys.executable, '-c', script], capture_output=True, text=True, timeout=20)
++    assert result.returncode == 0, result.stderr
++    assert 'Version:' in result.stdout
++
++
++@pytest.mark.parametrize('legacy, arguments, analogue, video', [
++    (False, [], True, 'udp'),
++    (False, ['--analogue-drive', '--video', 'udp'], True, 'udp'),
++    (False, ['--video', 'http'], True, 'http'),
++    (True, [], False, 'http'),
++    (True, ['--analogue-drive'], True, 'udp'),
++])
++def test_entry_points_select_expected_modes(mocker, legacy, arguments, analogue, video):
++    mocker.patch('sys.argv', ['controller', '--robot-ip', 'test.invalid', *arguments])
++    engine = mocker.patch.object(controller, 'GameEngine')
++    mocker.patch('pygame.init')
++    mocker.patch('pygame.quit')
++    (controller.legacy_main if legacy else controller.main)()
++    assert engine.call_args.kwargs['analogue_drive'] is analogue
++    assert engine.call_args.kwargs['video'] == video
++    engine.return_value.__enter__.return_value.run.assert_called_once()
++
++
++def test_missing_vision_extra_leaves_tracking_disabled(monkeypatch):
++    monkeypatch.setitem(sys.modules, 'ultralytics', None)
++    with Car(dry_run=True) as car:
++        with pytest.raises(RuntimeError, match='--extra vision'):
++            car.toggle_vision_tracking()
++        assert not car.vision_tracking_is_on
++        assert car.track(None) == []
++
++
++def test_optional_vision_loads_only_on_request(monkeypatch):
++    module = ModuleType('ultralytics')
++    module.YOLO = MagicMock()
++    monkeypatch.setitem(sys.modules, 'ultralytics', module)
++    with Car(dry_run=True) as car:
++        module.YOLO.assert_not_called()
++        car.toggle_vision_tracking()
++        car.track('frame')
++        module.YOLO.return_value.track.assert_called_once_with('frame')
++        car.toggle_vision_tracking()
++        module.YOLO.assert_called_once()
++        assert not car.vision_tracking_is_on
++
++
++def test_missing_navigation_extra_fails_before_robot_commands(monkeypatch, mocker):
++    monkeypatch.setitem(sys.modules, 'scipy.integrate', None)
++    with Car(dry_run=True) as car:
++        send = mocker.patch.object(car, '_Car__send_cmd')
++        with pytest.raises(RuntimeError, match='--extra navigation'):
++            car.turn_by(90)
++        send.assert_not_called()
++
++
++@pytest.mark.parametrize('choice', ['4', '5'])
++def test_missing_vision_in_legacy_menu_does_not_enable_autonomy(mocker, capsys, choice):
++    engine = controller.GameEngine.__new__(controller.GameEngine)
++    engine._GameEngine__car = MagicMock()
++    engine._GameEngine__car.vision_tracking_is_on = False
++    engine._GameEngine__car.toggle_vision_tracking.side_effect = RuntimeError('Install --extra vision')
++    engine._GameEngine__autonomous_mode = False
++    engine._GameEngine__run_person_follower = False
++    mocker.patch('builtins.input', return_value=choice)
++    engine._GameEngine__handle_terminal_input()
++    assert not engine._GameEngine__autonomous_mode
++    assert not engine._GameEngine__run_person_follower
++    assert '--extra vision' in capsys.readouterr().out
 diff --git a/tests/unit_tests/test_person_follower.py b/tests/unit_tests/test_person_follower.py
 index 3abbd8a..8c268a6 100644
 --- a/tests/unit_tests/test_person_follower.py
@@ -4802,653 +6237,3 @@ index 0000000..d8548d0
 +    { url = "https://files.pythonhosted.org/packages/36/f1/69566660f633e2a93df7dad7353761562e9f71bf8a5a7b1eb7f34793b45d/wcwidth-0.9.1-cp314-cp314t-win_arm64.whl", hash = "sha256:03cfca3dcbffa86564290fe3c9978a6191ba003e8ced7f7dbda315fcb3fbe725", size = 602291, upload-time = "2026-09-23T20:23:42.345Z" },
 +    { url = "https://files.pythonhosted.org/packages/96/a2/f06f2e0be4895e5943d358755b51968ace85774cf0a4cc42b4dafb793832/wcwidth-0.9.1-py3-none-any.whl", hash = "sha256:e0c3a1c45c5b9550c6919a4449e95f5b177f6e165786376981db8f1addae9b21", size = 300656, upload-time = "2026-09-23T20:23:20.674Z" },
 +]
-diff --git a/src/elegoo_robot_car4/camera_presets.py b/src/elegoo_robot_car4/camera_presets.py
-new file mode 100644
-index 0000000..7d03eaf
---- /dev/null
-+++ b/src/elegoo_robot_car4/camera_presets.py
-@@ -0,0 +1,95 @@
-+"""Runtime presets for the installed Arduino-ESP32 1.0.6 camera firmware."""
-+from dataclasses import dataclass
-+from queue import Queue, Empty
-+from threading import Thread, Lock
-+import requests
-+
-+
-+@dataclass(frozen=True)
-+class CameraPreset:
-+    name: str
-+    size: tuple[int, int]
-+    quality: int
-+    framesize: int
-+
-+
-+# Enum IDs from the installed 1.0.6 sensor.h, not the current ESP-IDF driver.
-+PRESETS = {
-+    'fast': CameraPreset('Fast', (320, 240), 20, 5),
-+    'drive': CameraPreset('Drive', (640, 480), 15, 8),
-+    'detail': CameraPreset('Detail', (1024, 768), 10, 10),
-+    'max': CameraPreset('Max detail', (1600, 1200), 10, 13),
-+}
-+
-+
-+def apply_preset(host, key, get=None):
-+    """Use one HTTP connection for the transaction; failures may be partial."""
-+    if get is None:
-+        with requests.Session() as session:
-+            return apply_preset(host, key, session.get)
-+    preset = PRESETS[key]
-+    for variable, value in [('quality', preset.quality), ('framesize', preset.framesize)]:
-+        response = get(f'http://{host}/control', params={'var': variable, 'val': value}, timeout=(2, 3))
-+        try:
-+            response.raise_for_status()
-+        finally:
-+            response.close()
-+    response = get(f'http://{host}/status', timeout=(2, 3))
-+    try:
-+        response.raise_for_status()
-+        status = response.json()
-+    finally:
-+        response.close()
-+    if not isinstance(status, dict):
-+        raise ValueError('Invalid camera status response')
-+    if status.get('quality') != preset.quality or status.get('framesize') != preset.framesize:
-+        raise ValueError('Camera settings did not match the requested preset')
-+
-+
-+class CameraSettings:
-+    """Single background request; no pygame calls or shared control socket."""
-+    def __init__(self, host):
-+        self.host = host
-+        self.results = Queue()
-+        self.busy = False
-+        # The legacy ESP32 has a small socket pool. Keep a single HTTP connection
-+        # across writes, readback AND later preset selections, instead of opening
-+        # a fresh connection for every requests.get().
-+        self._session = requests.Session()
-+        self._lock = Lock()
-+        self._working = False
-+        self._closed = False
-+
-+    def close(self):
-+        with self._lock:
-+            self._closed = True
-+            if not self._working:
-+                self._session.close()
-+
-+    def start(self, key):
-+        with self._lock:
-+            if key not in PRESETS or self.busy or self._closed:
-+                return False
-+            self.busy = self._working = True
-+        def work():
-+            try:
-+                apply_preset(self.host, key, self._session.get)
-+                result = (key, None)
-+            except (requests.RequestException, ValueError) as exc:
-+                result = (key, f'{type(exc).__name__}: {exc}')
-+            finally:
-+                with self._lock:
-+                    self._working = False
-+                    if self._closed:
-+                        self._session.close()
-+            self.results.put(result)
-+        Thread(target=work, name='camera-settings', daemon=True).start()
-+        return True
-+
-+    def poll(self):
-+        try:
-+            result = self.results.get_nowait()
-+        except Empty:
-+            return None
-+        self.busy = False
-+        return result
-diff --git a/src/elegoo_robot_car4/connection.py b/src/elegoo_robot_car4/connection.py
-new file mode 100644
-index 0000000..a6357aa
---- /dev/null
-+++ b/src/elegoo_robot_car4/connection.py
-@@ -0,0 +1,84 @@
-+"""Serialized dashboard I/O. No command queue survives a reconnect."""
-+from concurrent.futures import ThreadPoolExecutor
-+from contextlib import suppress
-+import time
-+
-+from .car import Car
-+from .udp_video import UdpVideo
-+
-+
-+class Connection:
-+    def __init__(self, ip, transport, log=False, car_factory=Car, video_factory=UdpVideo):
-+        self.ip, self.transport, self.log = ip, transport, log
-+        self.car_factory, self.video_factory = car_factory, video_factory
-+        self.car = self.video = None
-+        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='car-link')
-+        self.pending = None
-+        self.closed = False
-+        self.generation = 0
-+        self.ground_checked = -float("inf")
-+        self.raised = True
-+
-+    def submit(self, operation, *args):
-+        if self.pending is not None or self.closed:
-+            return False
-+        self.pending = self.executor.submit(operation, *args)
-+        return True
-+
-+    def poll(self):
-+        if self.pending is None or not self.pending.done():
-+            return None
-+        future, self.pending = self.pending, None
-+        try:
-+            return True, future.result()
-+        except Exception as exc:
-+            return False, exc
-+
-+    def disconnect(self):
-+        if self.car is not None:
-+            with suppress(Exception):
-+                self.car.stop()
-+            self.car.disconnect()
-+            self.car = None
-+        if self.video is not None:
-+            self.video.close()
-+            self.video = None
-+
-+    def connect(self):
-+        self.disconnect()
-+        self.ground_checked = -float("inf")
-+        self.raised = True
-+        try:
-+            self.car = self.car_factory(ip=self.ip, log=self.log, stop_before_init=True)
-+            self.car.enable_analogue_drive()
-+            self.car.drive_analogue(0, 0, 0)
-+            if self.transport == 'udp':
-+                self.video = self.video_factory(self.ip)
-+        except Exception:
-+            self.disconnect()
-+            raise
-+
-+    def invalidate(self):
-+        self.generation += 1
-+
-+    def exchange(self, demand, generation=None):
-+        # Keep the original 10 Hz sensor budget on the 38400-baud serial link.
-+        if time.monotonic()-self.ground_checked >= .1:
-+            self.raised = self.car.is_far_from_the_ground()
-+            self.ground_checked = time.monotonic()
-+        raised = self.raised
-+        left, right, head = demand
-+        if raised or self.closed or (generation is not None and generation != self.generation):
-+            left = right = 0
-+        started = time.monotonic()
-+        self.car.drive_analogue(left, right, head)
-+        ack = time.monotonic()
-+        frame = self.car.capture() if self.transport == 'http' else None
-+        return raised, (left, right, head), (ack-started)*1000, ack, frame
-+
-+    def close(self):
-+        self.closed = True
-+        self.invalidate()
-+        # Cleanup is serialized behind any in-flight call, never concurrent with recv.
-+        self.executor.submit(self.disconnect)
-+        self.executor.shutdown(wait=False)
-diff --git a/src/elegoo_robot_car4/optional_features.py b/src/elegoo_robot_car4/optional_features.py
-new file mode 100644
-index 0000000..e4c8286
---- /dev/null
-+++ b/src/elegoo_robot_car4/optional_features.py
-@@ -0,0 +1,23 @@
-+"""Dependencies loaded only when an optional feature is explicitly requested."""
-+
-+
-+def load_yolo(model_name):
-+    try:
-+        from ultralytics import YOLO
-+    except ModuleNotFoundError as exc:
-+        raise RuntimeError(
-+            "Vision is unavailable. Install the 'vision' extra with "
-+            "uv sync --extra vision (or pip install '.[vision]') in the repository."
-+        ) from exc
-+    return YOLO(model_name)
-+
-+
-+def navigation_integrator():
-+    try:
-+        from scipy.integrate import trapezoid
-+    except ModuleNotFoundError as exc:
-+        raise RuntimeError(
-+            "Gyro navigation is unavailable. Install the 'navigation' extra with "
-+            "uv sync --extra navigation (or pip install '.[navigation]') in the repository."
-+        ) from exc
-+    return trapezoid
-diff --git a/tests/unit_tests/test_camera_presets.py b/tests/unit_tests/test_camera_presets.py
-new file mode 100644
-index 0000000..535cdb0
---- /dev/null
-+++ b/tests/unit_tests/test_camera_presets.py
-@@ -0,0 +1,211 @@
-+from unittest.mock import MagicMock
-+import numpy as np
-+import pygame as pg
-+import pytest
-+import requests
-+from elegoo_robot_car4.camera_presets import PRESETS, apply_preset, CameraSettings
-+from elegoo_robot_car4.dashboard import Dashboard, DashboardState
-+from elegoo_robot_car4.elegoo_smartcar_control import GameEngine
-+from elegoo_robot_car4.analogue_drive import AnalogueDrive
-+
-+
-+@pytest.mark.parametrize('key,size,q,enum', [('fast',(320,240),20,5), ('drive',(640,480),15,8),
-+                                           ('detail',(1024,768),10,10), ('max',(1600,1200),10,13)])
-+def test_presets_write_expected_legacy_firmware_values_and_readback(key,size,q,enum):
-+    get=MagicMock()
-+    get.return_value.json.return_value={'quality':q,'framesize':enum}
-+    apply_preset('car.test',key,get)
-+    assert PRESETS[key].size == size
-+    assert get.call_args_list[0].kwargs['params']=={'var':'quality','val':q}
-+    assert get.call_args_list[1].kwargs['params']=={'var':'framesize','val':enum}
-+    assert get.call_args_list[2].args==('http://car.test/status',)
-+    assert all(c.kwargs['timeout']==(2,3) for c in get.call_args_list)
-+
-+
-+@pytest.mark.parametrize('status',[{'quality':10,'framesize':8},[],{}])
-+def test_mismatched_or_invalid_readback_is_failure(status):
-+    get=MagicMock();get.return_value.json.return_value=status
-+    with pytest.raises(ValueError):apply_preset('car.test','max',get)
-+
-+
-+def test_http_failure_stops_remaining_setting_requests():
-+    get=MagicMock();get.return_value.raise_for_status.side_effect=requests.HTTPError()
-+    with pytest.raises(requests.HTTPError):apply_preset('car.test','max',get)
-+    assert get.call_count==1
-+
-+
-+def engine():
-+    e=GameEngine.__new__(GameEngine)
-+    e._GameEngine__ui=DashboardState()
-+    e._GameEngine__car=MagicMock()
-+    e._GameEngine__analogue=AnalogueDrive(left=100,right=100)
-+    e._GameEngine__camera_settings=MagicMock()
-+    e._GameEngine__camera_settings.start.return_value=True
-+    e._GameEngine__camera_settings.poll.return_value=None
-+    e._GameEngine__stop_held=False
-+    e._GameEngine__preset_wait=None
-+    e._GameEngine__last_raw_frame=None
-+    e._GameEngine__video=None
-+    e._GameEngine__http_frames=0
-+    return e
-+
-+
-+def test_preset_selection_stops_before_request_and_disallows_duplicate():
-+    e=engine();events=[]
-+    e._GameEngine__car.stop.side_effect=lambda:events.append('stop')
-+    e._GameEngine__camera_settings.start.side_effect=lambda k:events.append(k) or True
-+    e._GameEngine__select_camera_preset('max')
-+    assert events==['stop','max']
-+    assert not e._GameEngine__stop_held and e._GameEngine__neutral_required
-+    assert e._GameEngine__ui.preset_pending and not e._GameEngine__ui.stopped
-+    assert e._GameEngine__analogue.left==0
-+    e._GameEngine__select_camera_preset('drive')
-+    assert events==['stop','max']
-+
-+
-+def test_failed_stop_does_not_change_camera():
-+    e=engine();e._GameEngine__car.stop.side_effect=TimeoutError()
-+    e._GameEngine__select_camera_preset('max')
-+    e._GameEngine__camera_settings.start.assert_not_called()
-+    assert e._GameEngine__ui.preset_error and not e._GameEngine__ui.preset_pending
-+    assert not e._GameEngine__stop_held and e._GameEngine__neutral_required
-+
-+
-+def test_http_success_waits_for_fresh_matching_frame(mocker):
-+    e=engine();e._GameEngine__ui.preset_pending=True
-+    e._GameEngine__camera_settings.poll.return_value=('max',None)
-+    now=mocker.patch('elegoo_robot_car4.elegoo_smartcar_control.time.monotonic',return_value=10)
-+    e._GameEngine__poll_camera_settings()
-+    frame=np.zeros((1200,1600,3),dtype=np.uint8)
-+    e._GameEngine__confirm_camera_frame(frame)
-+    assert e._GameEngine__ui.preset_pending
-+    now.return_value=11
-+    e._GameEngine__confirm_camera_frame(np.zeros((600,800,3),dtype=np.uint8))
-+    assert e._GameEngine__ui.preset_pending
-+    e._GameEngine__last_raw_frame=frame
-+    e._GameEngine__confirm_camera_frame(frame)
-+    assert e._GameEngine__ui.preset_pending
-+    e._GameEngine__last_raw_frame=None
-+    e._GameEngine__confirm_camera_frame(frame)
-+    assert not e._GameEngine__ui.preset_pending and e._GameEngine__ui.preset=='max'
-+
-+
-+def test_no_matching_video_times_out_and_allows_lower_preset(mocker):
-+    e=engine();e._GameEngine__ui.preset_pending=True
-+    e._GameEngine__preset_wait=('max',10,18)
-+    mocker.patch('elegoo_robot_car4.elegoo_smartcar_control.time.monotonic',return_value=19)
-+    e._GameEngine__poll_camera_settings()
-+    assert e._GameEngine__ui.preset_error and not e._GameEngine__ui.preset_pending
-+    e._GameEngine__select_camera_preset('drive')
-+    e._GameEngine__camera_settings.start.assert_called_once_with('drive')
-+
-+
-+def test_worker_serializes_requests_and_surfaces_errors(mocker):
-+    thread=mocker.patch('elegoo_robot_car4.camera_presets.Thread')
-+    apply=mocker.patch('elegoo_robot_car4.camera_presets.apply_preset',side_effect=requests.Timeout('offline'))
-+    settings=CameraSettings('car.test')
-+    assert settings.start('max')
-+    assert not settings.start('fast')
-+    assert settings.poll() is None
-+    thread.call_args.kwargs['target']()
-+    key,error=settings.poll()
-+    assert key=='max' and 'Timeout' in error
-+    assert not settings.busy
-+    apply.assert_called_once_with('car.test','max',settings._session.get)
-+
-+
-+def test_pending_preset_blocks_resume_even_after_zero_ack(mocker):
-+    e=engine();e._GameEngine__dry_run=False
-+    e._GameEngine__stop_held=True;e._GameEngine__resume_requested=True
-+    e._GameEngine__ui.preset_pending=True
-+    pad=MagicMock();pad.attached.return_value=True;pad.get_axis.return_value=0
-+    e._GameEngine__joysticks={1:pad}
-+    mocker.patch('pygame.key.get_focused',return_value=True)
-+    e._GameEngine__handle_analogue_actions()
-+    assert e._GameEngine__stop_held and not e._GameEngine__ui.can_resume
-+    e._GameEngine__car.drive_analogue.assert_called_once_with(0,0,0)
-+
-+
-+def test_preset_hitboxes_after_resize(monkeypatch):
-+    monkeypatch.setenv('SDL_VIDEODRIVER','dummy');monkeypatch.setenv('SDL_AUDIODRIVER','dummy')
-+    pg.init()
-+    try:
-+        d=Dashboard(preview=True)
-+        d.action(pg.event.Event(pg.VIDEORESIZE,w=960,h=720))
-+        for key,rect in d.PRESET_RECTS.items():
-+            point=tuple(round(p*d.scale+o) for p,o in zip(rect.center,d.offset))
-+            assert d.action(pg.event.Event(pg.MOUSEBUTTONDOWN,button=1,pos=point))=='preset:'+key
-+        d.draw(DashboardState(preset='max',preset_message='Max detail active.'),1)
-+    finally:pg.quit()
-+
-+
-+
-+def test_standalone_preset_reuses_one_session_for_all_requests(mocker):
-+    session=mocker.patch('elegoo_robot_car4.camera_presets.requests.Session').return_value.__enter__.return_value
-+    session.get.return_value.json.return_value={'quality':10,'framesize':13}
-+    apply_preset('car.test','max')
-+    assert session.get.call_count==3
-+    assert session.get.return_value.close.call_count==3
-+
-+
-+def test_worker_reuses_session_across_preset_selections_and_closes(mocker):
-+    session=mocker.patch('elegoo_robot_car4.camera_presets.requests.Session').return_value
-+    thread=mocker.patch('elegoo_robot_car4.camera_presets.Thread')
-+    apply=mocker.patch('elegoo_robot_car4.camera_presets.apply_preset')
-+    settings=CameraSettings('car.test')
-+    for key in ['fast','max','drive']:
-+        assert settings.start(key)
-+        thread.call_args.kwargs['target']()
-+        assert settings.poll()==(key,None)
-+        apply.assert_called_with('car.test',key,session.get)
-+    session.close.assert_not_called()
-+    settings.close()
-+    session.close.assert_called_once()
-+    assert not settings.start('max')
-+
-+
-+def test_close_during_worker_defers_session_cleanup(mocker):
-+    session=mocker.patch('elegoo_robot_car4.camera_presets.requests.Session').return_value
-+    thread=mocker.patch('elegoo_robot_car4.camera_presets.Thread')
-+    mocker.patch('elegoo_robot_car4.camera_presets.apply_preset')
-+    settings=CameraSettings('car.test')
-+    assert settings.start('fast')
-+    settings.close()
-+    session.close.assert_not_called()
-+    thread.call_args.kwargs['target']()
-+    session.close.assert_called_once()
-+    assert not settings.start('drive')
-+
-+
-+
-+def test_preset_recovers_without_resume_but_never_replays_held_throttle(mocker):
-+    e=engine();e._GameEngine__dry_run=False
-+    axes={pg.CONTROLLER_AXIS_TRIGGERRIGHT:32767}
-+    pad=MagicMock();pad.attached.return_value=True;pad.get_button.return_value=False
-+    pad.get_axis.side_effect=lambda a:axes.get(a,0)
-+    e._GameEngine__joysticks={1:pad}
-+    mocker.patch('pygame.key.get_focused',return_value=True)
-+    mocker.patch('pygame.display.set_caption')
-+    e._GameEngine__select_camera_preset('max')
-+    axes.clear()
-+    e._GameEngine__handle_analogue_actions()
-+    assert e._GameEngine__neutral_required and not e._GameEngine__stop_held
-+    assert e._GameEngine__ui.status=='Changing camera'
-+    e._GameEngine__ui.preset_pending=False
-+    axes[pg.CONTROLLER_AXIS_TRIGGERRIGHT]=32767
-+    e._GameEngine__handle_analogue_actions()
-+    assert e._GameEngine__neutral_required
-+    axes.clear()
-+    e._GameEngine__handle_analogue_actions()
-+    assert not e._GameEngine__neutral_required
-+    assert e._GameEngine__ui.status=='Ready'
-+    assert all(c.args[:2]==(0,0) for c in e._GameEngine__car.drive_analogue.call_args_list)
-+    axes[pg.CONTROLLER_AXIS_TRIGGERRIGHT]=32767
-+    e._GameEngine__handle_analogue_actions()
-+    assert e._GameEngine__car.drive_analogue.call_args.args[0]>0
-+
-+
-+def test_preset_does_not_clear_an_explicit_manual_stop():
-+    e=engine();e._GameEngine__stop_held=True;e._GameEngine__ui.stopped=True
-+    e._GameEngine__select_camera_preset('drive')
-+    assert e._GameEngine__stop_held and e._GameEngine__ui.stopped
-diff --git a/tests/unit_tests/test_connection.py b/tests/unit_tests/test_connection.py
-new file mode 100644
-index 0000000..e29d21c
---- /dev/null
-+++ b/tests/unit_tests/test_connection.py
-@@ -0,0 +1,106 @@
-+"""Reconnect I/O checks without connecting to hardware."""
-+from concurrent.futures import Future
-+from threading import Event
-+from unittest.mock import MagicMock
-+
-+from elegoo_robot_car4.connection import Connection
-+
-+
-+class ImmediateExecutor:
-+    def submit(self, function, *args):
-+        result = Future()
-+        try:
-+            result.set_result(function(*args))
-+        except Exception as exc:
-+            result.set_exception(exc)
-+        return result
-+
-+    def shutdown(self, **kwargs):
-+        pass
-+
-+
-+def test_connect_replaces_socket_handshake_video_and_starts_zero():
-+    first, second = MagicMock(), MagicMock()
-+    factory = MagicMock(side_effect=[first, second])
-+    videos = MagicMock()
-+    link = Connection('test.invalid', 'udp', car_factory=factory, video_factory=videos)
-+    link.connect()
-+    video1 = link.video
-+    link.connect()
-+    first.stop.assert_called_once()
-+    first.disconnect.assert_called_once()
-+    video1.close.assert_called_once()
-+    second.enable_analogue_drive.assert_called_once()
-+    second.drive_analogue.assert_called_once_with(0, 0, 0)
-+    assert factory.call_args.kwargs['stop_before_init']
-+    link.close()
-+    link.executor.shutdown(wait=True)
-+
-+
-+def test_handshake_failure_closes_partial_connection():
-+    car = MagicMock()
-+    car.enable_analogue_drive.side_effect = TimeoutError('no firmware reply')
-+    link = Connection('test.invalid', 'udp', car_factory=MagicMock(return_value=car))
-+    link.submit(link.connect)
-+    link.executor.shutdown(wait=True)
-+    success, error = link.poll()
-+    assert not success and isinstance(error, TimeoutError)
-+    car.disconnect.assert_called_once()
-+    assert link.car is None and link.video is None
-+
-+
-+def test_slow_io_does_not_block_poll_or_queue_more_demands():
-+    entered, release = Event(), Event()
-+    def slow():
-+        entered.set()
-+        assert release.wait(5)
-+        return 'done'
-+    link = Connection('test.invalid', 'udp')
-+    try:
-+        assert link.submit(slow)
-+        assert entered.wait(2)
-+        assert link.poll() is None
-+        assert not link.submit(lambda: 'stale motor command')
-+    finally:
-+        release.set()
-+        link.executor.shutdown(wait=True)
-+    assert link.poll() == (True, 'done')
-+    assert link.poll() is None
-+
-+
-+def test_raised_car_overrides_moving_demand():
-+    link = Connection('test.invalid', 'udp')
-+    link.car = MagicMock()
-+    link.car.is_far_from_the_ground.return_value = True
-+    raised, demand, _, _, frame = link.exchange((100, -100, 20))
-+    assert raised and demand == (0, 0, 20) and frame is None
-+    link.car.drive_analogue.assert_called_once_with(0, 0, 20)
-+    link.close()
-+    link.executor.shutdown(wait=True)
-+
-+
-+def test_stop_during_sensor_query_cancels_unsent_motor_demand():
-+    link = Connection('test.invalid', 'udp')
-+    link.car = MagicMock()
-+    generation = link.generation
-+    def ground():
-+        link.invalidate()  # UI requests Stop while the sensor call is pending.
-+        return False
-+    link.car.is_far_from_the_ground.side_effect = ground
-+    link.exchange((180, 180, 0), generation)
-+    link.car.drive_analogue.assert_called_once_with(0, 0, 0)
-+    link.close()
-+    link.executor.shutdown(wait=True)
-+
-+
-+def test_failed_car_initialization_closes_socket_before_retry(mocker):
-+    from elegoo_robot_car4.car import Car
-+    socket = mocker.patch('elegoo_robot_car4.car.socket.socket').return_value
-+    stop = mocker.patch.object(Car, 'stop')
-+    calibration = mocker.patch.object(Car, '_Car__compute_mpu_offsets', side_effect=TimeoutError('IMU'))
-+    import pytest
-+    with pytest.raises(TimeoutError):
-+        Car('test.invalid', stop_before_init=True)
-+    stop.assert_called_once()
-+    calibration.assert_called_once()
-+    socket.close.assert_called_once()
-diff --git a/tests/unit_tests/test_optional_features.py b/tests/unit_tests/test_optional_features.py
-new file mode 100644
-index 0000000..ecf3922
---- /dev/null
-+++ b/tests/unit_tests/test_optional_features.py
-@@ -0,0 +1,95 @@
-+import subprocess
-+import sys
-+from types import ModuleType
-+from unittest.mock import MagicMock
-+
-+import pytest
-+
-+from elegoo_robot_car4 import Car
-+from elegoo_robot_car4 import elegoo_smartcar_control as controller
-+
-+
-+def test_default_imports_work_when_optional_dependencies_are_blocked():
-+    script = """
-+import importlib.abc
-+import sys
-+
-+class BlockOptional(importlib.abc.MetaPathFinder):
-+    def find_spec(self, fullname, path=None, target=None):
-+        if fullname.split('.')[0] in {'torch', 'torchvision', 'ultralytics', 'lap', 'scipy', 'pandas', 'matplotlib', 'seaborn'}:
-+            raise AssertionError('Default startup imported '+fullname)
-+
-+sys.meta_path.insert(0, BlockOptional())
-+from elegoo_robot_car4.elegoo_smartcar_control import main
-+assert 'elegoo_robot_car4.person_follower' not in sys.modules
-+sys.argv = ['elegoo-smartcar-control', '--version']
-+main()
-+"""
-+    result = subprocess.run([sys.executable, '-c', script], capture_output=True, text=True, timeout=20)
-+    assert result.returncode == 0, result.stderr
-+    assert 'Version:' in result.stdout
-+
-+
-+@pytest.mark.parametrize('legacy, arguments, analogue, video', [
-+    (False, [], True, 'udp'),
-+    (False, ['--analogue-drive', '--video', 'udp'], True, 'udp'),
-+    (False, ['--video', 'http'], True, 'http'),
-+    (True, [], False, 'http'),
-+    (True, ['--analogue-drive'], True, 'udp'),
-+])
-+def test_entry_points_select_expected_modes(mocker, legacy, arguments, analogue, video):
-+    mocker.patch('sys.argv', ['controller', '--robot-ip', 'test.invalid', *arguments])
-+    engine = mocker.patch.object(controller, 'GameEngine')
-+    mocker.patch('pygame.init')
-+    mocker.patch('pygame.quit')
-+    (controller.legacy_main if legacy else controller.main)()
-+    assert engine.call_args.kwargs['analogue_drive'] is analogue
-+    assert engine.call_args.kwargs['video'] == video
-+    engine.return_value.__enter__.return_value.run.assert_called_once()
-+
-+
-+def test_missing_vision_extra_leaves_tracking_disabled(monkeypatch):
-+    monkeypatch.setitem(sys.modules, 'ultralytics', None)
-+    with Car(dry_run=True) as car:
-+        with pytest.raises(RuntimeError, match='--extra vision'):
-+            car.toggle_vision_tracking()
-+        assert not car.vision_tracking_is_on
-+        assert car.track(None) == []
-+
-+
-+def test_optional_vision_loads_only_on_request(monkeypatch):
-+    module = ModuleType('ultralytics')
-+    module.YOLO = MagicMock()
-+    monkeypatch.setitem(sys.modules, 'ultralytics', module)
-+    with Car(dry_run=True) as car:
-+        module.YOLO.assert_not_called()
-+        car.toggle_vision_tracking()
-+        car.track('frame')
-+        module.YOLO.return_value.track.assert_called_once_with('frame')
-+        car.toggle_vision_tracking()
-+        module.YOLO.assert_called_once()
-+        assert not car.vision_tracking_is_on
-+
-+
-+def test_missing_navigation_extra_fails_before_robot_commands(monkeypatch, mocker):
-+    monkeypatch.setitem(sys.modules, 'scipy.integrate', None)
-+    with Car(dry_run=True) as car:
-+        send = mocker.patch.object(car, '_Car__send_cmd')
-+        with pytest.raises(RuntimeError, match='--extra navigation'):
-+            car.turn_by(90)
-+        send.assert_not_called()
-+
-+
-+@pytest.mark.parametrize('choice', ['4', '5'])
-+def test_missing_vision_in_legacy_menu_does_not_enable_autonomy(mocker, capsys, choice):
-+    engine = controller.GameEngine.__new__(controller.GameEngine)
-+    engine._GameEngine__car = MagicMock()
-+    engine._GameEngine__car.vision_tracking_is_on = False
-+    engine._GameEngine__car.toggle_vision_tracking.side_effect = RuntimeError('Install --extra vision')
-+    engine._GameEngine__autonomous_mode = False
-+    engine._GameEngine__run_person_follower = False
-+    mocker.patch('builtins.input', return_value=choice)
-+    engine._GameEngine__handle_terminal_input()
-+    assert not engine._GameEngine__autonomous_mode
-+    assert not engine._GameEngine__run_person_follower
-+    assert '--extra vision' in capsys.readouterr().out

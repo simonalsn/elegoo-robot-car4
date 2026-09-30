@@ -21,6 +21,7 @@ from .udp_video import UdpVideo
 from .analogue_drive import AnalogueDrive
 from .dashboard import Dashboard, DashboardState
 from .camera_presets import CameraSettings, PRESETS
+from .video_adaptation import VideoAdaptation
 
 if TYPE_CHECKING:
     from ultralytics.engine.results import Results
@@ -87,6 +88,8 @@ class GameEngine:
         self.__fps_sample = (time.monotonic(), 0)
         self.__http_frames = 0
         self.__trace_camera = trace_camera
+        self.__adaptation = VideoAdaptation()
+        self.__requested_preset = None
         if analogue_drive and not self.__connection:
             try:
                 self.__car.enable_analogue_drive()
@@ -298,6 +301,7 @@ class GameEngine:
         preset_requested = None
         http_frame = None
         http_at = 0.0
+        self.__render_at = 0.0
 
         def reset_view():
             link.invalidate()
@@ -309,6 +313,8 @@ class GameEngine:
             self.__dashboard.frame = self.__dashboard._scaled_frame = None
             self.__dashboard.frame_size = None
             self.__preset_wait = None
+            self.__requested_preset = None
+            self.__adaptation.reset(time.monotonic())
             self.__http_frames = 0
             ui.preset_error = False
             ui.ack_at = ui.ack_ms = ui.fps = ui.preset = None
@@ -316,11 +322,11 @@ class GameEngine:
             ui.video_stale = True
             ui.preset_pending = False
             ui.can_resume = False
-            ui.preset_message = 'Reconnect resets camera state; select a preset once connected.'
+            ui.preset_message = 'Balanced will be applied once connected.'
 
         reset_view()
         while True:
-            clock.tick(30)
+            clock.tick(120)
             events = pg.event.get()
             if any(e.type == pg.QUIT or (e.type == pg.KEYDOWN and e.key == pg.K_ESCAPE) for e in events):
                 break
@@ -333,6 +339,7 @@ class GameEngine:
                 zero_confirmed = False
                 self.__analogue.stop()
             if 'reconnect' in actions:
+                link.interrupt()
                 reconnect, connected = True, False
                 retry_at = 0
                 preset_requested = None
@@ -345,9 +352,11 @@ class GameEngine:
             if result is not None:
                 ok, value = result
                 if not ok:
-                    print(f'Car link failed; reconnecting: {value}', flush=True)
+                    cancelled = reconnect and isinstance(value, ConnectionAbortedError)
+                    if not cancelled:
+                        print(f'Car link failed; reconnecting: {value}', flush=True)
                     reconnect, connected = True, False
-                    retry_at = time.monotonic()+2
+                    retry_at = time.monotonic()+(0 if cancelled else 2)
                     preset_requested = None
                     http_frame = None
                     zero_confirmed = False
@@ -358,7 +367,15 @@ class GameEngine:
                         self.__car, self.__video = link.car, link.video
                         self.__fps_sample = (time.monotonic(), 0)
                         zero_confirmed = True
-                elif not reconnect and connected:
+                        operation = 'control'
+                        link.update_demand((0, 0, 0))
+                        link.start_control()
+                        # Apply the startup preset through the same zero-speed,
+                        # settings-readback and fresh-frame gates as a button click.
+                        preset_requested = self.__requested_preset = 'balanced'
+                        ui.preset_pending = True
+                        ui.preset_message = 'Stopping before applying Balanced.'
+                elif not reconnect and connected and value is not None:
                     raised, wheels, ui.ack_ms, ui.ack_at, frame = value
                     ui.left, ui.right, ui.head = wheels
                     self.__trace_camera_command(getattr(self, "_GameEngine__submitted_camera", 0), wheels[2])
@@ -370,19 +387,19 @@ class GameEngine:
                     if preset_requested and zero_confirmed:
                         self.__camera_settings.start(preset_requested)
                         preset_requested = None
-                operation = None
 
             self.__poll_camera_settings()
-            if reconnect and link.pending is None and not self.__camera_settings.busy and time.monotonic() >= retry_at:
+            if reconnect and link.pending is None and time.monotonic() >= retry_at:
                 reset_view()
                 self.__camera_settings.close()
                 self.__camera_settings = CameraSettings(link.ip)
                 reconnect = False
+                link.prepare_connect()
                 operation = 'connect'
                 link.submit(link.connect)
 
             if not connected:
-                self.__dashboard_status('Reconnecting', 'Keep the car stationary for sensor calibration. Retrying automatically; Stop stays latched.')
+                self.__dashboard_status('Reconnecting', 'Checking firmware and zero wheel speeds. Retrying automatically; Stop stays latched.')
                 self.__render_dashboard()
                 continue
 
@@ -401,10 +418,24 @@ class GameEngine:
             for action in actions:
                 if isinstance(action, str) and action.startswith('preset:') and not ui.preset_pending and 'stop' not in actions:
                     preset_requested = action.split(':', 1)[1]
+                    self.__requested_preset = preset_requested
+                    self.__adaptation.reset(time.monotonic())
                     ui.preset_pending = True
                     ui.preset_error = False
                     ui.preset = None
                     ui.preset_message = 'Stopping before applying '+PRESETS[preset_requested].name+'.'
+                    self.__neutral_required = True
+
+            if (self.__video is not None and link.transport == 'udp' and not ui.preset_pending
+                    and not self.__camera_settings.busy and ui.ack_at is not None
+                    and time.monotonic()-ui.ack_at < .5):
+                quality = self.__adaptation.recommend(
+                    self.__video.diagnostics(), ui.frame_age, self.__requested_preset,
+                    self.__camera_settings.quality, time.monotonic())
+                if quality is not None:
+                    preset_requested = f'quality:{quality}'
+                    ui.preset_pending = True
+                    ui.preset_message = f'Video exceeds its budget; stopping before adjusting JPEG quality to {quality}.'
                     self.__neutral_required = True
 
             pad = next((p for p in self.__joysticks.values() if p.attached()), None)
@@ -418,7 +449,7 @@ class GameEngine:
             neutral = forward <= .04 and reverse <= .04 and abs(steering) <= .08
             ui.throttle = 0 if forward > .04 and reverse > .04 else forward-reverse
             ui.steering = steering
-            healthy = fresh and not raised and pad is not None and focused and not ui.preset_pending
+            healthy = fresh and not raised and pad is not None and focused and not ui.preset_pending and not link.input_expired
             if not healthy:
                 link.invalidate()
                 self.__neutral_required = True
@@ -444,16 +475,13 @@ class GameEngine:
             else:
                 self.__dashboard_status('Ready' if neutral else 'Driving', 'Manual input active. You have control.', 'good')
 
-            # Sample only when the worker is available: never queue stale motor demands.
-            if link.pending is None:
-                if not healthy or was_blocked:
-                    self.__analogue.stop()
-                    demand = (0, 0, round(self.__analogue.head))
-                else:
-                    demand = self.__analogue.update(forward, reverse, steering, camera, time.monotonic())
-                self.__submitted_camera = camera
-                operation = 'exchange'
-                link.submit(link.exchange, demand, link.generation)
+            if not healthy or was_blocked:
+                self.__analogue.stop()
+                demand = (0, 0, round(self.__analogue.head))
+            else:
+                demand = self.__analogue.update(forward, reverse, steering, camera, time.monotonic())
+            self.__submitted_camera = camera
+            link.update_demand(demand)
             self.__render_dashboard()
 
     def __detect_relevant_events(self, events: list[pg.Event]) -> None:
@@ -644,12 +672,13 @@ class GameEngine:
             else:
                 now = time.monotonic()
                 self.__preset_wait = (key, now, now+8)
-                self.__ui.preset_message = 'Settings accepted; waiting for a fresh '+PRESETS[key].name+' frame.'
+                name = 'JPEG '+key.split(':')[1] if key.startswith('quality:') else PRESETS[key].name
+                self.__ui.preset_message = 'Settings accepted; waiting for a fresh '+name+' frame.'
         wait = getattr(self, "_GameEngine__preset_wait", None)
         if wait and time.monotonic() > wait[2]:
             self.__ui.preset_pending = False
             self.__ui.preset_error = True
-            self.__ui.preset_message = 'No matching video frame. Try Drive or Fast (Max detail may exceed the frame-size limit).'
+            self.__ui.preset_message = 'No matching video frame. Try Balanced, Drive or Fast.'
             self.__preset_wait = None
 
     def __confirm_camera_frame(self, frame):
@@ -663,10 +692,12 @@ class GameEngine:
         if self.__video is not None:
             _, age = self.__video.latest()
             fresh = fresh and time.monotonic()-age > applied+.2
-        if fresh and (frame.shape[1], frame.shape[0]) == PRESETS[key].size:
-            self.__ui.preset = key
+        quality_only = key.startswith('quality:')
+        if fresh and (quality_only or (frame.shape[1], frame.shape[0]) == PRESETS[key].size):
+            self.__ui.preset = self.__requested_preset if quality_only else key
             self.__ui.preset_pending = False
-            self.__ui.preset_message = PRESETS[key].name+' active. Release driving controls to continue; manual Stop, if set, still needs Resume.'
+            name = 'Adaptive JPEG '+key.split(':')[1] if quality_only else PRESETS[key].name
+            self.__ui.preset_message = name+' active. Release driving controls to continue; manual Stop, if set, still needs Resume.'
             self.__preset_wait = None
             self.__fps_sample = (time.monotonic(), self.__video.frames if self.__video else self.__http_frames)
             self.__ui.fps = None
@@ -682,6 +713,10 @@ class GameEngine:
         dashboard = getattr(self, "_GameEngine__dashboard", None)
         if dashboard is None:
             return
+        now = time.monotonic()
+        if now-getattr(self, '_GameEngine__render_at', -float('inf')) < 1/30:
+            return
+        self.__render_at = now
         ui = self.__ui
         pad = next((p for p in self.__joysticks.values() if p.attached()), None)
         ui.controller = pad.name if pad else 'No controller connected'

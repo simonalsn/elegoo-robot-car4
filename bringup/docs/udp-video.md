@@ -32,7 +32,7 @@ After reassembly, use one video client at a time:
 elegoo-smartcar-control --robot-ip 192.168.0.213 --video udp
 ```
 
-HTTP remains the default for compatibility; explicitly select `--video udp`. Existing
+UDP is now the dashboard default. Existing
 `--video http`, `/capture` and `:81/stream` remain available. Do not open an HTTP
 camera feed while using UDP: they compete for camera buffers and Wi-Fi airtime.
 
@@ -42,7 +42,8 @@ Custom JPEG-over-UDP, not RTP/H.264: it uses the camera's existing JPEG output.
 Camera configuration remains 800x600, JPEG quality 10 with PSRAM, XCLK 10 MHz,
 two frame buffers. Wi-Fi sleep is disabled to reduce power-save delays.
 A FreeRTOS task at priority 1 sends video independently of TCP control/serial.
-No retransmission, FEC or adaptive bitrate is implemented.
+No retransmission or FEC is implemented. The desktop can adapt JPEG quality for
+Detail/Max detail when frames are too large, stale or frequently incomplete.
 
 The PC uses a connected UDP socket to camera port 5000. Subscribe/renew every
 500 ms with `EVS1` plus a random uint32 session token. Stop with `EVX1` plus the
@@ -67,12 +68,18 @@ frame, and runs outside the pygame/control loop. UDP loss drops frames instead
 of waiting for retransmission. It is not a guarantee of higher image quality
 or a particular latency on congested Wi-Fi.
 
-If no decoded frame has arrived for 750 ms, the controller blanks the image,
-requests stop and blocks driving; Escape still works. This is local receive
-age, not a synchronized capture-to-display latency measurement. Sensor queries
-still block the control loop, and its existing 10 Hz cap remains. Those are
-separate future responsiveness work. Client-side stop is best-effort; firmware
-still lacks a reliable motor command lease on link loss.
+Frames older than 750 ms are discarded before/after decoding and driving is
+blocked while the video is stale. First-packet receive time is preserved; Linux
+kernel timestamps include socket backlog where supported. This is local receive
+age, not synchronized capture-to-display latency. Control refresh now runs in an
+independent worker, with 10 Hz ground queries and a 400 ms UNO motor-command lease.
+
+The diagnostic firmware installed on 2026-09-30 adds `EVT1`, struct `!4sIIIIII` (28 bytes):
+magic, session token, capture-attempt count, oversized-frame count, send-failure
+count, last JPEG byte size and current quality. Counters are uint32 and reset on
+reboot. A status packet is sent approximately once a second while capturing.
+Older firmware does not emit these messages; clients work without them.
+See [review fixes, verified upload and immediate rollback](active-code-review-fixes.md).
 
 ## Flash and rollback
 
