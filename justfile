@@ -126,6 +126,9 @@ init: check-uv
     @echo "Creating production .venv"
     uv sync --no-dev --no-group test
 
+init-optional: check-uv
+    uv sync --no-dev --group test --all-extras
+
 # Updates all prek git hooks to their latest version.
 update-hooks: check-uv
     @echo "Updating prek git hooks"

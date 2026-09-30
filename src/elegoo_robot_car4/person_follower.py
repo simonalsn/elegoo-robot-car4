@@ -1,6 +1,12 @@
 #  Copyright (c) Michele De Stefano - 2026.
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 import numpy as np
-from ultralytics.engine.results import Results
+
+if TYPE_CHECKING:
+    from ultralytics.engine.results import Results
 
 from elegoo_robot_car4 import Car
 

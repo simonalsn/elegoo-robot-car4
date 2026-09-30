@@ -121,7 +121,7 @@ def dashboard(monkeypatch):
 @pytest.mark.parametrize('size', [(1280, 960), (900, 700), (1600, 900)])
 def test_stop_and_resume_hitboxes_follow_letterboxed_resize(dashboard, size):
     dashboard.action(pg.event.Event(pg.VIDEORESIZE, w=size[0], h=size[1]))
-    for rect, expected in [(Dashboard.STOP, 'stop'), (Dashboard.RESUME, 'resume')]:
+    for rect, expected in [(Dashboard.STOP, 'stop'), (Dashboard.RESUME, 'resume'), (Dashboard.RECONNECT, 'reconnect')]:
         point = tuple(round(p*dashboard.scale+o) for p,o in zip(rect.center, dashboard.offset))
         assert dashboard.action(pg.event.Event(pg.MOUSEBUTTONDOWN, button=1, pos=point)) == expected
     assert dashboard.action(pg.event.Event(pg.KEYDOWN, key=pg.K_SPACE)) == 'stop'
@@ -149,9 +149,10 @@ def test_actual_dashboard_loop_uses_cached_udp_frame_and_stop_resume(dashboard, 
     video = mocker.patch('elegoo_robot_car4.elegoo_smartcar_control.UdpVideo').return_value
     video.latest.return_value = (np.zeros((600, 800, 3), dtype=np.uint8), .02)
     video.frames = 1
-    mocker.patch('elegoo_robot_car4.elegoo_smartcar_control.PersonFollower')
     mocker.patch('pygame.key.get_focused', return_value=True)
     mocker.patch('pygame.time.Clock')
+    from tests.unit_tests.test_connection import ImmediateExecutor
+    mocker.patch('elegoo_robot_car4.connection.ThreadPoolExecutor', return_value=ImmediateExecutor())
     with GameEngine('test.invalid', video='udp', analogue_drive=True) as e:
         pad = MagicMock()
         pad.name = 'Test controller'
@@ -162,7 +163,7 @@ def test_actual_dashboard_loop_uses_cached_udp_frame_and_stop_resume(dashboard, 
         view = e._GameEngine__dashboard
         render_frame = mocker.spy(view, 'set_frame')
         point = tuple(round(p*view.scale+o) for p,o in zip(view.RESUME.center, view.offset))
-        mocker.patch('pygame.event.get', side_effect=[[], [pg.event.Event(pg.KEYDOWN, key=pg.K_SPACE)],
+        mocker.patch('pygame.event.get', side_effect=[[], [], [], [pg.event.Event(pg.KEYDOWN, key=pg.K_SPACE)],
                     [], [pg.event.Event(pg.MOUSEBUTTONDOWN, button=1, pos=point)], [], [pg.event.Event(pg.QUIT)]])
         e.run()
         assert e._GameEngine__ui.status == 'Ready'
@@ -200,3 +201,68 @@ def test_raised_stop_timeout_keeps_dashboard_alive_and_drive_blocked(mocker):
     assert e._GameEngine__ui.status == 'Stop unconfirmed'
     assert e._GameEngine__neutral_required
     e._GameEngine__car.drive_analogue.assert_not_called()
+
+
+@pytest.mark.parametrize('manual_stop', [False, True])
+@pytest.mark.parametrize('reconnect_button', [False, True])
+def test_reboot_retries_without_replaying_held_trigger(dashboard, mocker, manual_stop, reconnect_button):
+    import numpy as np
+    from tests.unit_tests.test_connection import ImmediateExecutor
+    car1, car2 = MagicMock(), MagicMock()
+    for car in (car1, car2):
+        car.vision_tracking_is_on = False
+        car.is_far_from_the_ground.return_value = False
+    factory = mocker.patch('elegoo_robot_car4.elegoo_smartcar_control.Car', side_effect=[car1, TimeoutError('booting'), car2])
+    video = mocker.patch('elegoo_robot_car4.elegoo_smartcar_control.UdpVideo').return_value
+    video.latest.return_value = (np.zeros((600, 800, 3), dtype=np.uint8), .02)
+    video.frames = 1
+    mocker.patch('elegoo_robot_car4.connection.ThreadPoolExecutor', return_value=ImmediateExecutor())
+    mocker.patch('pygame.key.get_focused', return_value=True)
+    now = [100.0]
+    mocker.patch('time.monotonic', side_effect=lambda: now[0])
+    clock = mocker.patch('pygame.time.Clock').return_value
+    clock.tick.side_effect = lambda *_: now.__setitem__(0, now[0]+.1)
+    with GameEngine('test.invalid', video='udp', analogue_drive=True) as e:
+        pad = MagicMock()
+        pad.attached.return_value = True
+        pad.get_button.return_value = False
+        held = [False]
+        pad.get_axis.side_effect = lambda axis: 32767 if held[0] and axis == pg.CONTROLLER_AXIS_TRIGGERRIGHT else 0
+        e._GameEngine__joysticks = {1: pad}
+        ticks = [0]
+        def events():
+            ticks[0] += 1
+            tick = ticks[0]
+            if tick == 5:
+                held[0] = True
+            if tick == 8:
+                # Break the old TCP connection after some successful driving.
+                actions = [pg.event.Event(pg.KEYDOWN, key=pg.K_SPACE)] if manual_stop else []
+                if reconnect_button:
+                    view = e._GameEngine__dashboard
+                    point = tuple(round(p*view.scale+o) for p,o in zip(view.RECONNECT.center, view.offset))
+                    actions.append(pg.event.Event(pg.MOUSEBUTTONDOWN, button=1, pos=point))
+                else:
+                    car1.is_far_from_the_ground.side_effect = ConnectionResetError('reboot')
+                return actions
+            if tick == 60:
+                assert factory.call_count == 3  # one failed retry, then recovered
+                assert car2.drive_analogue.call_count > 0
+                assert all(c.args[:2] == (0, 0) for c in car2.drive_analogue.call_args_list)
+                assert e._GameEngine__stop_held == manual_stop
+                held[0] = False
+            if tick == 65 and manual_stop:
+                assert e._GameEngine__ui.can_resume
+                view = e._GameEngine__dashboard
+                point = tuple(round(p*view.scale+o) for p,o in zip(view.RESUME.center, view.offset))
+                return [pg.event.Event(pg.MOUSEBUTTONDOWN, button=1, pos=point)]
+            if tick == 68:
+                held[0] = True
+            if tick == 72:
+                return [pg.event.Event(pg.QUIT)]
+            return []
+        mocker.patch('pygame.event.get', side_effect=events)
+        e.run()
+        assert any(c.args[0] > 0 for c in car1.drive_analogue.call_args_list)
+        assert any(c.args[0] > 0 for c in car2.drive_analogue.call_args_list)
+        assert not e._GameEngine__stop_held

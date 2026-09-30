@@ -3,8 +3,8 @@ from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
-import torch
-from ultralytics.engine.results import Results
+torch = pytest.importorskip("torch", reason="Requires the vision extra")
+Results = pytest.importorskip("ultralytics.engine.results", reason="Requires the vision extra").Results
 
 from elegoo_robot_car4 import Car
 from elegoo_robot_car4.person_follower import PersonFollower

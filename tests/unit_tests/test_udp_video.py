@@ -90,3 +90,17 @@ def test_real_udp_subscription_decode_and_unsubscribe():
                 break
     finally:
         server.close()
+
+
+
+def test_receiver_diagnostics_distinguish_incomplete_and_expired_frames():
+    data=b'\xff\xd8'+b'x'*1300+b'\xff\xd9'
+    a=FrameAssembler(123)
+    a.feed(packets(data,1)[0],0)
+    a.feed(packets(data,2)[0],.1)
+    assert a.incomplete_frames==1
+    a.feed(packets(data,2)[1],.4)
+    assert a.expired_frames==1
+    for packet in packets(data,3):a.feed(packet,.5)
+    assert a.completed_frames==1 and a.last_frame_bytes==len(data)
+    assert a.incomplete_frames==1  # expired frames are not counted twice

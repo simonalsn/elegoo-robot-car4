@@ -1,4 +1,4 @@
-# ELEGOO V4 bring-up: Python environment for the unchanged upstream client.
+# ELEGOO V4 driving and firmware development environment.
 { pkgs ? import <nixpkgs> { } }:
 
 pkgs.mkShell {
@@ -48,7 +48,7 @@ pkgs.mkShell {
 
     car-setup() {
       uv sync --project "$ELEGOO_PROJECT_ROOT/upstream" \
-        --python "$UV_PYTHON" --no-dev --group test || return
+        --python "$UV_PYTHON" --no-dev --group test "$@" || return
       source "$ELEGOO_PROJECT_ROOT/upstream/.venv/bin/activate"
     }
 

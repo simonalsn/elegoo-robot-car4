@@ -1,4 +1,6 @@
 #  Copyright (c) Michele De Stefano - 2026.
+from __future__ import annotations
+
 import json
 import re
 import socket
@@ -6,14 +8,16 @@ import time
 from collections import deque
 from collections.abc import Callable
 from contextlib import AbstractContextManager, suppress
+from typing import TYPE_CHECKING
 
 import cv2 as cv
 import numpy as np
 import requests as req
-import scipy.integrate
-from ultralytics import YOLO
-from ultralytics.engine.model import Model
-from ultralytics.engine.results import Results
+from .optional_features import load_yolo, navigation_integrator
+
+if TYPE_CHECKING:
+    from ultralytics.engine.model import Model
+    from ultralytics.engine.results import Results
 
 
 class ControlProtocolError(OSError):
@@ -88,6 +92,7 @@ class Car(AbstractContextManager):
         port: int = 100,
         log: bool = False,
         dry_run: bool = False,
+        stop_before_init: bool = False,
     ):
         """
         Initializes the connection with the car.
@@ -120,9 +125,15 @@ class Car(AbstractContextManager):
             # Set a timeout of 2 seconds for all the blocking operations on
             # this socket
             self.__socket.settimeout(2)
-            self.__socket.connect((ip, port))
-            self.__compute_mpu_offsets()
-            self.set_head_angle()
+            try:
+                self.__socket.connect((ip, port))
+                if stop_before_init:
+                    self.stop()
+                self.__compute_mpu_offsets()
+                self.set_head_angle()
+            except Exception:
+                self.__socket.close()
+                raise
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.disconnect()
@@ -168,10 +179,10 @@ class Car(AbstractContextManager):
             on: If True, switches the vision-tracking mode on. Otherwise it
                 switches it off.
         """
-        self.__vision_tracking_on = not self.__vision_tracking_on
-        self.__tracking_model = (
-            YOLO(self.__yolo_model) if self.__vision_tracking_on else None
-        )
+        enabled = not self.__vision_tracking_on
+        model = load_yolo(self.__yolo_model) if enabled else None
+        self.__tracking_model = model
+        self.__vision_tracking_on = enabled
 
     def disconnect(self) -> None:
         """
@@ -482,6 +493,7 @@ class Car(AbstractContextManager):
             angle:  The rotation angle in degrees. Positive angle is
                     counterclockwise.
         """
+        integrate = navigation_integrator()
         if self.log:  # pragma: no cover
             print("====== TURNING ======")
         # NOTE: I experimentally found that speed = 50 grants an accurate
@@ -501,7 +513,7 @@ class Car(AbstractContextManager):
             t = mpu_data["t"]
             delta_t = t - t0
             wz = mpu_data["g"][-1] - self.__g_offsets[-1]
-            delta_angle = scipy.integrate.trapezoid([wz0, wz], dx=delta_t)
+            delta_angle = integrate([wz0, wz], dx=delta_t)
             alpha += delta_angle
             if self.log:  # pragma: no cover
                 print(f"delta_t = {delta_t}")

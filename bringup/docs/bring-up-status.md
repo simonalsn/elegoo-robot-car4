@@ -340,3 +340,56 @@ Stop/Space latch and explicit neutral-before-resume are implemented. Offline
 preview is available with `--dashboard-preview`. Rendering and control interlocks
 are tested with mocked hardware; no robot commands or physical driving test were
 performed for this change. See `docs/dashboard/README.md` for usage and limitations.
+
+## Runtime video presets
+
+Added Fast 320x240/JPEG20, Drive 640x480/JPEG15, Detail 1024x768/JPEG10,
+and Max detail 1600x1200/JPEG10 to the dashboard. Runtime HTTP settings use
+existing camera firmware, with background requests and readback plus fresh-frame
+confirmation. Selection confirms Stop first and holds driving until explicit
+Resume. No firmware, clock or buffering change; actual FPS comparison pending.
+Max detail can exceed the existing 256 KiB frame cap; failures allow retry with
+a smaller preset. No hardware commands were sent during implementation.
+
+Preset request failures reproduced with UDP and TCP control active: separate
+HTTP connections failed after the first write; a persistent Session succeeded.
+Client now reuses the Session across preset selections and closes it on shutdown.
+All 135 tests pass. Live Stop-only checks decoded all presets: Fast ~25 fps,
+Drive ~11.3, Detail ~5.3, Max ~3.3 (brief 3-second samples). Restored and verified
+800x600/JPEG10 afterward. See dashboard notes and local logs/camera-presets/probe.json.
+The single startup control timeout in the user's report was not reproduced.
+
+User reports Max detail pauses with stale-video indication (not a control timeout).
+Preset changes now recover with fresh video and neutral controls, without a Resume
+click; only explicit Stop/Space sets the manual latch. Manual stops are preserved.
+Requested larger UDP receive buffering and added bounded stale-video diagnostics;
+frame size/expiry/freshness limits are unchanged. Physical improvement to Max-detail
+video is not yet confirmed; no live robot commands sent for this update.
+
+
+## 2026-09-30 — Dashboard reconnection
+
+Added automatic control-link retries and a Reconnect button to analogue mode.
+A single background worker owns connection setup and control exchanges, repeats
+Stop/calibration/firmware handshake, and replaces UDP or HTTP video. Fresh video
+and neutral controls gate recovery; a manual Stop remains latched. Pending motor
+commands are not queued or replayed. Camera preset status resets to unknown;
+IP changes still require launching with the new address. No firmware changed.
+Mocked restart/retry and safety tests cover this update; live reboot validation
+has not been performed. See dashboard/README.md for details.
+
+## 2026-09-30 — Optional upstream features
+
+Retained upstream vision, person-following, autonomous helper and legacy controller
+source while excluding heavy dependencies from the default installation. Vision,
+navigation and calibration are installation extras; imports occur on explicit use.
+The normal command now defaults to the dashboard with UDP video; the original
+controller has a separate `elegoo-smartcar-legacy` entry point. Existing explicit
+dashboard flags still work. `car-setup` accepts optional-extra arguments and plain
+`car-setup` restores the minimal environment. Firmware and sensor APIs are unchanged.
+
+Validation: 34 targeted tests passed with vision/navigation dependencies installed;
+after synchronizing the minimal environment, the full suite passed 152 tests with
+two optional checks skipped. The wheel and source distribution build offline.
+The local environment now uses the minimal dependency set. No live robot commands
+or firmware changes were needed for this update.

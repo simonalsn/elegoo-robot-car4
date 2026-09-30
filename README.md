@@ -20,6 +20,9 @@ illustrative values and a camera placeholder.*
   left stick for steering, and simultaneous driving and turning. Cubic response
   curves, a tuned minimum motor output, acceleration limiting, and extra steering
   authority while moving make fine adjustments easier. Both triggers together stop.
+- **Runtime camera presets:** switch between Fast (320×240), Drive (640×480),
+  Detail (1024×768) and Max detail (1600×1200). Changing modes holds the car
+  paused until settings, fresh video and neutral driving inputs are confirmed.
 - **Camera control:** the right stick sets the pan target and releasing it centres
   the camera. Servo firmware changes address idle twitch and pulse cutoff.
 - **A proper desktop dashboard:** a large camera view, clear driving/blocking
@@ -31,13 +34,18 @@ illustrative values and a camera placeholder.*
   38400-baud UNO–ESP32 link, corrupt-reply handling, and a firmware motor-command
   lease. These changes substantially improved responsiveness on the tested car;
   there is no guaranteed latency figure for other networks or hardware.
+- **Reconnect without restarting:** the analogue dashboard automatically retries
+  a lost control connection; its Reconnect button also restarts the link and video.
+  Keep the car stationary during sensor calibration. Fresh video and neutral
+  controls are required before driving, and manual Stop stays latched.
 - **Explicit Stop/Resume:** Space or the Stop button latches driving off. Release
   the driving controls, then click Resume. Recovery from lost focus, stale video,
   or control errors also requires neutral controls.
 
 The indicators show requested inputs and acknowledged command targets, **not
-measured vehicle speed or physical servo position**. Network calls are still
-synchronous, so a control timeout can briefly stall the interface.
+measured vehicle speed or physical servo position**. In the analogue dashboard,
+control I/O and reconnection run on a background worker so network timeouts do
+not freeze the interface. The legacy keyboard controller remains synchronous.
 
 ## Hardware and firmware
 
@@ -62,13 +70,15 @@ firmware versions; the current tested serial link uses **38400 baud**.
 With the Python environment installed and the matching firmware running:
 
 ```sh
-elegoo-smartcar-control --robot-ip YOUR_ROBOT_IP --video udp --analogue-drive
+elegoo-smartcar-control --robot-ip YOUR_ROBOT_IP
 ```
 
 The robot joins your router's Wi-Fi network. Use its assigned IP address and keep
 the controller window focused. Escape closes the controller and requests Stop.
-The dashboard is enabled by `--analogue-drive`; the original HTTP/legacy control
-path is retained for compatibility. This fork's additions are in this repository;
+The dashboard and UDP video are now the defaults. Existing commands using
+`--video udp --analogue-drive` still work. The original controller is retained as
+`elegoo-smartcar-legacy --robot-ip YOUR_ROBOT_IP` (HTTP video by default).
+This fork's additions are in this repository;
 the upstream PyPI package does not include them.
 
 To inspect the interface **without connecting to a robot**:
@@ -94,10 +104,41 @@ nix-shell
 car-setup
 ```
 
-This installs the Python environment; it does not configure or flash the boards.
-The existing computer-vision dependencies, including Ultralytics/PyTorch, remain
-and can make the first installation large. See [workspace notes](bringup/WORKSPACE.md)
+This installs the default driving environment and tests; it does not configure or
+flash the boards. Optional vision, navigation and plotting dependencies are excluded.
+See [workspace notes](bringup/WORKSPACE.md)
 for the layout and [original documentation](UPSTREAM_README.md) for upstream context.
+
+### Optional features
+
+All upstream feature source remains in the repository and Python package. The
+default installation requires only NumPy, OpenCV, pygame-ce and Requests (plus
+their dependencies). It does not install or import Ultralytics, Torch, Torchvision,
+LAP, SciPy or plotting packages. Optional modules are loaded only when requested;
+installing an extra does not automatically activate driving or tracking modes.
+
+| Feature | Install from the workspace's Nix shell | Activate |
+| --- | --- | --- |
+| YOLO tracking / person following | `car-setup --extra vision` | Launch `elegoo-smartcar-legacy`, press T, select 4 or 5 |
+| Gyro navigation | `car-setup --extra navigation` | Explicit library calls such as `Car.turn_by()` |
+| Calibration plotting | `car-setup --extra calibration` | Run `compute_ultrasonic_calibration.py` from `upstream/data/` |
+
+Extras can be combined, for example `car-setup --extra vision --extra navigation`.
+Run plain `car-setup` to return to the default environment. Outside the Nix shell,
+use `uv sync --no-dev --group test --extra vision` from the repository, or install
+the local checkout with `pip install '.[vision]'`. Substitute the desired extra.
+
+The legacy controller retains keyboard/gamepad input and its terminal menu for
+stock line tracking, obstacle avoidance and ultrasonic following. Those modes are
+not exposed in the dashboard. They retain the original synchronous behavior and
+do not gain the dashboard's reconnect and Stop/Resume interlocks. Autonomous
+navigation helpers remain available for explicit experiments; sensor APIs and
+startup IMU calibration remain part of normal operation. Firmware is unchanged.
+
+Vision activation may download model weights on first use. If optional
+dependencies are absent, activation reports the required extra and leaves tracking
+disabled. The retained source is included in builds; extras select dependencies,
+not which source files go into the package.
 
 ## Development notes
 
@@ -107,14 +148,16 @@ for the layout and [original documentation](UPSTREAM_README.md) for upstream con
 - [Servo fixes](bringup/docs/servo-idle.md)
 - [Dashboard controls and validation](bringup/docs/dashboard/README.md)
 
-The current client has 117 passing tests, including mocked control faults,
-Stop/Resume interlocks, UDP handling and dashboard resizing. Hardware observations
+Tests cover mocked control faults, Stop/Resume interlocks, UDP handling, dashboard
+resizing and default startup with optional imports blocked. Run `pytest tests/ -q`
+in the configured environment. Tests requiring real vision/navigation packages
+skip when those extras are absent; to exercise the retained features, run
+`car-setup --all-extras` then the same test command from `upstream/`. Hardware observations
 and limitations are recorded in the bring-up notes; automated tests do not replace
 an attended driving check on another car.
 
 Possible next steps include display toggles, calibrated vehicle-width and
-turning-path overlays, removing unused vision dependencies, and keeping the GUI
-responsive during network timeouts.
+turning-path overlays.
 
 ## Credits and license
 

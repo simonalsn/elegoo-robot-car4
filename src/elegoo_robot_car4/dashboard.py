@@ -2,6 +2,7 @@
 from dataclasses import dataclass
 import math
 import pygame as pg
+from .camera_presets import PRESETS
 
 
 @dataclass
@@ -23,10 +24,14 @@ class DashboardState:
     video_stale: bool = True
     stopped: bool = False
     can_resume: bool = False
+    preset: str | None = None
+    preset_pending: bool = False
+    preset_message: str = 'Current camera settings unchanged. Select a preset to compare.'
+    preset_error: bool = False
 
 
 class Dashboard:
-    SIZE = (1280, 960)
+    SIZE = (1280, 1060)
     BG = '#101619'
     PANEL = '#1a2328'
     EDGE = '#303c43'
@@ -36,11 +41,13 @@ class Dashboard:
     AMBER = '#f8c876'
     RED = '#ff9399'
     STOP = pg.Rect(930, 237, 304, 46)
+    RECONNECT = pg.Rect(1090, 27, 166, 44)
     RESUME = pg.Rect(930, 291, 304, 32)
+    PRESET_RECTS = {key: pg.Rect(244+i*246, 876, 234, 43) for i, key in enumerate(PRESETS)}
 
     def __init__(self, robot_ip='', transport='udp', preview=False):
         pg.font.init()
-        self.screen = pg.display.set_mode((1200, 900), pg.RESIZABLE)
+        self.screen = pg.display.set_mode((1200, 960), pg.RESIZABLE)
         self.canvas = pg.Surface(self.SIZE)
         self.fonts = {size: pg.font.SysFont('sans', size) for size in (14, 16, 18, 22, 28, 32)}
         self.robot_ip, self.transport, self.preview = robot_ip, transport, preview
@@ -66,10 +73,15 @@ class Dashboard:
         if event.type == pg.MOUSEBUTTONDOWN and event.button == 1:
             self._transform()
             point = tuple((p-o)/self.scale for p, o in zip(event.pos, self.offset))
+            if self.RECONNECT.collidepoint(point):
+                return 'reconnect'
             if self.STOP.collidepoint(point):
                 return 'stop'
             if self.RESUME.collidepoint(point):
                 return 'resume'
+            for key, rect in self.PRESET_RECTS.items():
+                if rect.collidepoint(point):
+                    return 'preset:'+key
         return None
 
     def set_frame(self, surface):
@@ -117,7 +129,9 @@ class Dashboard:
         connected = state.ack_at is not None and now-state.ack_at < 2
         label = 'OFFLINE PREVIEW - no robot connection' if self.preview else (
             ('Control responding' if connected else 'Control awaiting reply')+'  /  '+self.robot_ip)
-        self.text(label, 750, 45, 16, self.AMBER if self.preview or not connected else self.GREEN)
+        self.text(label, 610, 45, 16, self.AMBER if self.preview or not connected else self.GREEN)
+        pg.draw.rect(self.canvas, '#29453d', self.RECONNECT, border_radius=5)
+        self.text('Reconnect', 1115, 39, 18)
         self.panel(pg.Rect(24, 98, 864, 750))
         self.text('Camera', 42, 108, 22)
         resolution = 'Waiting for frames' if self.frame_size is None else f'{self.frame_size[0]} x {self.frame_size[1]}'
@@ -176,17 +190,29 @@ class Dashboard:
         self.wrapped(state.controller, 930, 739, 300, 16, self.MUTED)
         self.text('Window focused' if state.focused else 'Window unfocused - driving blocked', 930, 798, 16,
                   self.GREEN if state.focused else self.AMBER)
-        self.panel(pg.Rect(24, 866, 1232, 68))
+        self.panel(pg.Rect(24, 866, 1232, 86))
+        self.text('Camera presets', 42, 886, 22)
+        for key, rect in self.PRESET_RECTS.items():
+            preset = PRESETS[key]
+            selected = state.preset == key
+            pg.draw.rect(self.canvas, '#29453d' if selected else '#25323a', rect, border_radius=5)
+            self.text(preset.name, rect.x+10, rect.y+3, 18, self.GREEN if selected else self.TEXT)
+            self.text(f'{preset.size[0]} x {preset.size[1]}  /  JPEG {preset.quality}', rect.x+10, rect.y+24, 14, self.MUTED)
+        message = state.preset_message
+        while self.fonts[14].size(message)[0] > 1196:
+            message = message[:-4]+'...'
+        self.text(message, 42, 928, 14, self.AMBER if state.preset_error or state.preset_pending else self.MUTED)
+        self.panel(pg.Rect(24, 968, 1232, 68))
         guides = [('RT / LT', 'Forward / reverse', 'Both triggers stop'),
                   ('LEFT STICK', 'Steer / stationary pivot', 'Mix steering with throttle'),
                   ('RIGHT STICK', 'Aim camera', 'Release or X to centre'),
                   ('SPACE / STOP', 'Stop and hold', 'Neutral, then click Resume')]
         for x, (key, title, detail) in zip((42, 350, 658, 966), guides):
-            self.text(key, x, 872, 14, self.GREEN)
-            self.text(title, x, 891, 16)
-            self.text(detail, x, 913, 14, self.MUTED)
-        self.text('Manual mode / ground and fresh-video checks enabled', 24, 940, 14, self.MUTED)
-        self.text('Esc: exit', 1170, 940, 14, self.MUTED)
+            self.text(key, x, 974, 14, self.GREEN)
+            self.text(title, x, 993, 16)
+            self.text(detail, x, 1015, 14, self.MUTED)
+        self.text('Manual mode / ground and fresh-video checks enabled', 24, 1042, 14, self.MUTED)
+        self.text('Esc: exit', 1170, 1042, 14, self.MUTED)
         self._transform()
         size = (round(self.SIZE[0]*self.scale), round(self.SIZE[1]*self.scale))
         self.screen.fill(self.BG)
@@ -223,6 +249,10 @@ def preview():
                 if e.type == pg.QUIT or (e.type == pg.KEYDOWN and e.key == pg.K_ESCAPE):
                     running = False
                 action = dashboard.action(e)
+                if action and action.startswith('preset:'):
+                    key = action.split(':')[1]
+                    state.preset = key
+                    state.preset_message = PRESETS[key].name+' selected (offline illustration only; no camera settings sent).'
                 if action == 'stop':
                     state.status, state.reason, state.level = 'Stopped by you', 'Offline stop preview. Click Resume to reset.', 'error'
                     state.stopped = state.can_resume = True

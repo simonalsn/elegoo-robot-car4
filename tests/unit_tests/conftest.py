@@ -97,13 +97,13 @@ def capture_request_mock(mocker, resources_path: Path) -> MagicMock:
 
 @pytest.fixture(scope="function")
 def yolo_model_mock(mocker) -> MagicMock:
-    return mocker.patch("elegoo_robot_car4.car.Model", autospec=True)
+    return MagicMock()
 
 
 @pytest.fixture(scope="function")
 def yolo_class_mock(mocker, yolo_model_mock: MagicMock) -> MagicMock:
     return mocker.patch(
-        "elegoo_robot_car4.car.YOLO",
+        "elegoo_robot_car4.car.load_yolo",
         autospec=True,
         return_value=yolo_model_mock,
     )

@@ -2,6 +2,7 @@
 from unittest.mock import MagicMock
 
 import numpy as np
+import pytest
 
 from elegoo_robot_car4.car import Car
 
@@ -81,6 +82,7 @@ def test_capture_with_dry_run() -> None:
 
 
 def test_turn_by(car_mocks: dict[str, MagicMock]) -> None:
+    pytest.importorskip("scipy", reason="Requires the navigation extra")
     # given
     angle: int = 30  # turn by 30 degrees, counterclockwise
     get_mpu_data_mock = car_mocks["get_mpu_data"]

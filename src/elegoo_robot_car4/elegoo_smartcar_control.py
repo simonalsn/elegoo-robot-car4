@@ -1,25 +1,30 @@
 #  Copyright (c) Michele De Stefano - 2023.
+from __future__ import annotations
 
 import argparse
 import functools as fun
 import time
 from contextlib import suppress
 from collections.abc import Callable
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 import cv2 as cv
 import numpy as np
 import pygame as pg
 from pygame._sdl2 import controller as gamecontroller
 import requests
-from ultralytics.engine.results import Results
 
 from .__init__ import __version__
 from .car import Car
-from .person_follower import PersonFollower
+from .connection import Connection
 from .udp_video import UdpVideo
 from .analogue_drive import AnalogueDrive
 from .dashboard import Dashboard, DashboardState
+from .camera_presets import CameraSettings, PRESETS
+
+if TYPE_CHECKING:
+    from ultralytics.engine.results import Results
+    from .person_follower import PersonFollower
 
 
 class GameEngine:
@@ -68,35 +73,37 @@ class GameEngine:
         self.__dry_run = dry_run
         self.__autonomous_mode = False
         self.__run_person_follower = False
-        self.__car = Car(ip=robot_ip, log=log, dry_run=dry_run)
+        self.__connection = Connection(robot_ip, video, log, car_factory=Car, video_factory=UdpVideo) if analogue_drive and not dry_run else None
+        self.__car = None if self.__connection else Car(ip=robot_ip, log=log, dry_run=dry_run)
         self.__analogue = AnalogueDrive() if analogue_drive else None
         self.__neutral_required = analogue_drive
         self.__stop_held = False
         self.__resume_requested = False
         self.__ui = DashboardState() if analogue_drive else None
         self.__dashboard = None
+        self.__camera_settings = CameraSettings(robot_ip) if analogue_drive and not dry_run else None
+        self.__preset_wait = None
         self.__last_raw_frame = None
         self.__fps_sample = (time.monotonic(), 0)
         self.__http_frames = 0
         self.__trace_camera = trace_camera
-        if analogue_drive:
+        if analogue_drive and not self.__connection:
             try:
                 self.__car.enable_analogue_drive()
             except Exception:
                 self.__car.disconnect()
                 raise
         self.__last_track_results = []
-        self.__video = UdpVideo(robot_ip) if video == "udp" and not dry_run else None
+        self.__video = UdpVideo(robot_ip) if video == "udp" and not dry_run and not self.__connection else None
         # UDP starts asynchronously; no HTTP capture before the window opens.
         # capture shape (height, width), OpenCV format
         capture_shape = np.array(
-            self.__dry_run_size if dry_run else ((600, 800) if self.__video else self.__car.capture().shape[:2])
+            self.__dry_run_size if dry_run else ((600, 800) if self.__video or self.__connection else self.__car.capture().shape[:2])
         )
         # pygame requires frames in (width, height) format
         display_size = self.__dry_run_size if dry_run else capture_shape[::-1]
-        self.__person_follower = PersonFollower(
-            car=self.__car, frame_shape_hw=capture_shape
-        )
+        self.__capture_shape = capture_shape
+        self.__person_follower = None
         if analogue_drive:
             self.__dashboard = Dashboard(robot_ip, 'preview' if dry_run else video, preview=dry_run)
             self.__display = self.__dashboard.screen
@@ -123,6 +130,11 @@ class GameEngine:
                 ui.frame_age = age
                 self.__update_video_rate(self.__video.frames)
             if frame is None or age > 0.75:
+                now = time.monotonic()
+                if now-getattr(self, "_GameEngine__video_report_at", 0) >= 2:
+                    self.__video_report_at = now
+                    print(f"Video stale: age={age:.2f}s; {self.__video.diagnostics()}. "
+                          "This is a video pause, not proof that the control connection was lost.", flush=True)
                 # Never drive using a frozen image. Keep the window responsive
                 # while waiting for the subscription or recovering packet loss.
                 if dashboard is None:
@@ -138,6 +150,7 @@ class GameEngine:
                 self.__update_video_rate(self.__http_frames)
                 ui.frame_age = 0.0  # HTTP image has just been received, not capture latency.
         if dashboard is not None:
+            self.__confirm_camera_frame(frame)
             ui.video_stale = False
             if frame is not self.__last_raw_frame:
                 self.__last_raw_frame = frame
@@ -146,7 +159,10 @@ class GameEngine:
         frame = self.__process_frame(frame)
         if self.__display.get_size() != frame.shape[:2]:
             self.__display = pg.display.set_mode(frame.shape[:2])
-            self.__person_follower = PersonFollower(self.__car, np.array(frame.shape[:2][::-1]))
+            self.__capture_shape = np.array(frame.shape[:2][::-1])
+            if self.__person_follower is not None:
+                from .person_follower import PersonFollower
+                self.__person_follower = PersonFollower(self.__car, self.__capture_shape)
         # blit it to the display surface.  simple!
         pg.surfarray.blit_array(self.__display, frame)
         pg.display.update()
@@ -175,6 +191,8 @@ class GameEngine:
         Runs the game loop, translating player commands to the robot.
         """
 
+        if getattr(self, "_GameEngine__connection", None) is not None:
+            return self.__run_reconnecting()
         clock = pg.time.Clock()
         failures = 0
         ground_checked = 0.0
@@ -189,6 +207,7 @@ class GameEngine:
             try:
                 self.__detect_relevant_events(events)
                 self.__handle_dashboard_events(events)
+                self.__poll_camera_settings()
                 try:
                     if self.__display_new_frame() is False:
                         self.__car.stop()
@@ -267,6 +286,176 @@ class GameEngine:
             finally:
                 self.__render_dashboard()
 
+    def __run_reconnecting(self):
+        link, ui = self.__connection, self.__ui
+        clock = pg.time.Clock()
+        connected = False
+        reconnect = True
+        operation = None
+        retry_at = 0.0
+        raised = True
+        zero_confirmed = False
+        preset_requested = None
+        http_frame = None
+        http_at = 0.0
+
+        def reset_view():
+            link.invalidate()
+            self.__analogue.head = 0
+            self.__neutral_required = True
+            self.__analogue.stop()
+            self.__video = None
+            self.__last_raw_frame = None
+            self.__dashboard.frame = self.__dashboard._scaled_frame = None
+            self.__dashboard.frame_size = None
+            self.__preset_wait = None
+            self.__http_frames = 0
+            ui.preset_error = False
+            ui.ack_at = ui.ack_ms = ui.fps = ui.preset = None
+            ui.frame_age = float('inf')
+            ui.video_stale = True
+            ui.preset_pending = False
+            ui.can_resume = False
+            ui.preset_message = 'Reconnect resets camera state; select a preset once connected.'
+
+        reset_view()
+        while True:
+            clock.tick(30)
+            events = pg.event.get()
+            if any(e.type == pg.QUIT or (e.type == pg.KEYDOWN and e.key == pg.K_ESCAPE) for e in events):
+                break
+            self.__detect_relevant_events(events)
+            actions = [self.__dashboard.action(e) for e in events]
+            if 'stop' in actions:
+                link.invalidate()
+                self.__stop_held = ui.stopped = True
+                self.__neutral_required = True
+                zero_confirmed = False
+                self.__analogue.stop()
+            if 'reconnect' in actions:
+                reconnect, connected = True, False
+                retry_at = 0
+                preset_requested = None
+                http_frame = None
+                zero_confirmed = False
+                reset_view()
+
+            # Consume each result once. Results from before Reconnect cannot arm driving.
+            result = link.poll()
+            if result is not None:
+                ok, value = result
+                if not ok:
+                    print(f'Car link failed; reconnecting: {value}', flush=True)
+                    reconnect, connected = True, False
+                    retry_at = time.monotonic()+2
+                    preset_requested = None
+                    http_frame = None
+                    zero_confirmed = False
+                    reset_view()
+                elif operation == 'connect':
+                    if not reconnect:
+                        connected = True
+                        self.__car, self.__video = link.car, link.video
+                        self.__fps_sample = (time.monotonic(), 0)
+                        zero_confirmed = True
+                elif not reconnect and connected:
+                    raised, wheels, ui.ack_ms, ui.ack_at, frame = value
+                    ui.left, ui.right, ui.head = wheels
+                    self.__trace_camera_command(getattr(self, "_GameEngine__submitted_camera", 0), wheels[2])
+                    zero_confirmed = wheels[:2] == (0, 0)
+                    if frame is not None:
+                        http_frame, http_at = frame, time.monotonic()
+                        self.__http_frames += 1
+                        self.__update_video_rate(self.__http_frames)
+                    if preset_requested and zero_confirmed:
+                        self.__camera_settings.start(preset_requested)
+                        preset_requested = None
+                operation = None
+
+            self.__poll_camera_settings()
+            if reconnect and link.pending is None and not self.__camera_settings.busy and time.monotonic() >= retry_at:
+                reset_view()
+                self.__camera_settings.close()
+                self.__camera_settings = CameraSettings(link.ip)
+                reconnect = False
+                operation = 'connect'
+                link.submit(link.connect)
+
+            if not connected:
+                self.__dashboard_status('Reconnecting', 'Keep the car stationary for sensor calibration. Retrying automatically; Stop stays latched.')
+                self.__render_dashboard()
+                continue
+
+            fresh = False
+            if self.__video is not None:
+                fresh = self.__display_new_frame() is True
+            elif http_frame is not None:
+                ui.frame_age = time.monotonic()-http_at
+                fresh = ui.frame_age <= .75
+                if fresh and http_frame is not self.__last_raw_frame:
+                    self.__confirm_camera_frame(http_frame)
+                    self.__last_raw_frame = http_frame
+                    self.__dashboard.set_frame(pg.surfarray.make_surface(self.__process_frame(http_frame)))
+                ui.video_stale = not fresh
+
+            for action in actions:
+                if isinstance(action, str) and action.startswith('preset:') and not ui.preset_pending and 'stop' not in actions:
+                    preset_requested = action.split(':', 1)[1]
+                    ui.preset_pending = True
+                    ui.preset_error = False
+                    ui.preset = None
+                    ui.preset_message = 'Stopping before applying '+PRESETS[preset_requested].name+'.'
+                    self.__neutral_required = True
+
+            pad = next((p for p in self.__joysticks.values() if p.attached()), None)
+            focused = pg.key.get_focused()
+            forward = reverse = steering = camera = 0
+            if pad is not None:
+                forward = max(0, pad.get_axis(pg.CONTROLLER_AXIS_TRIGGERRIGHT)/32768)
+                reverse = max(0, pad.get_axis(pg.CONTROLLER_AXIS_TRIGGERLEFT)/32768)
+                steering = pad.get_axis(pg.CONTROLLER_AXIS_LEFTX)/32768
+                camera = 0 if pad.get_button(pg.CONTROLLER_BUTTON_X) else pad.get_axis(pg.CONTROLLER_AXIS_RIGHTX)/32768
+            neutral = forward <= .04 and reverse <= .04 and abs(steering) <= .08
+            ui.throttle = 0 if forward > .04 and reverse > .04 else forward-reverse
+            ui.steering = steering
+            healthy = fresh and not raised and pad is not None and focused and not ui.preset_pending
+            if not healthy:
+                link.invalidate()
+                self.__neutral_required = True
+            ui.can_resume = self.__stop_held and healthy and neutral and zero_confirmed
+            if 'resume' in actions and 'stop' not in actions and ui.can_resume:
+                self.__stop_held = ui.stopped = False
+            was_blocked = self.__neutral_required or self.__stop_held
+            if healthy and neutral and zero_confirmed and not self.__stop_held:
+                self.__neutral_required = False
+            if self.__stop_held:
+                self.__dashboard_status('Stopped by you', 'Release driving controls, then click Resume.', 'error')
+                ui.can_resume = healthy and neutral and zero_confirmed
+            elif not fresh:
+                self.__dashboard_status('Driving blocked', 'Video is stale. Waiting for fresh frames and neutral controls.')
+            elif raised:
+                self.__dashboard_status('Driving blocked', 'Car is raised. Place it on the ground and release driving controls.')
+            elif pad is None or not focused:
+                self.__dashboard_status('Driving blocked', 'Connect the controller, focus this window and release driving controls.')
+            elif ui.preset_pending:
+                self.__dashboard_status('Changing camera', 'Waiting for fresh video. Release driving controls.')
+            elif self.__neutral_required:
+                self.__dashboard_status('Release controls', 'Release both triggers and steering before driving can resume.')
+            else:
+                self.__dashboard_status('Ready' if neutral else 'Driving', 'Manual input active. You have control.', 'good')
+
+            # Sample only when the worker is available: never queue stale motor demands.
+            if link.pending is None:
+                if not healthy or was_blocked:
+                    self.__analogue.stop()
+                    demand = (0, 0, round(self.__analogue.head))
+                else:
+                    demand = self.__analogue.update(forward, reverse, steering, camera, time.monotonic())
+                self.__submitted_camera = camera
+                operation = 'exchange'
+                link.submit(link.exchange, demand, link.generation)
+            self.__render_dashboard()
+
     def __detect_relevant_events(self, events: list[pg.Event]) -> None:
         # Process hotplug even while raised or waiting for video. Otherwise the
         # initial connection event is consumed and the pad is never registered.
@@ -327,7 +516,8 @@ class GameEngine:
         if ui is not None:
             ui.throttle = 0 if forward > .04 and reverse > .04 else forward-reverse
             ui.steering = steering
-        if getattr(self, "_GameEngine__neutral_required", False) or getattr(self, "_GameEngine__stop_held", False):
+        if (getattr(self, "_GameEngine__neutral_required", False) or getattr(self, "_GameEngine__stop_held", False)
+                or (ui is not None and ui.preset_pending)):
             analogue.stop()
             try:
                 self.__send_analogue(0, 0, round(analogue.head))
@@ -338,14 +528,17 @@ class GameEngine:
             if getattr(self, "_GameEngine__stop_held", False):
                 self.__dashboard_status('Stopped by you', 'Release driving controls, then click Resume.', 'error')
                 if ui is not None:
-                    ui.can_resume = neutral
+                    ui.can_resume = neutral and not ui.preset_pending
                     ui.left = ui.right = 0
-                if neutral and getattr(self, "_GameEngine__resume_requested", False):
+                if neutral and not (ui is not None and ui.preset_pending) and getattr(self, "_GameEngine__resume_requested", False):
                     self.__stop_held = False
                     self.__neutral_required = False
                     if ui is not None:
                         ui.stopped = ui.can_resume = False
                     self.__dashboard_status('Ready', 'Controls neutral. Use the triggers to drive.', 'good')
+            elif ui is not None and ui.preset_pending:
+                self.__dashboard_status('Changing camera', 'Waiting for fresh video. Release driving controls.')
+                ui.left = ui.right = 0
             elif neutral:
                 self.__neutral_required = False
                 self.__dashboard_status('Ready', 'Controls neutral. Use the triggers to drive.', 'good')
@@ -404,8 +597,79 @@ class GameEngine:
                 self.__car.stop()
             except OSError:
                 self.__dashboard_status('Stop unconfirmed', 'Control link did not confirm Stop. Driving remains blocked.', 'error')
+        elif any(isinstance(action, str) and action.startswith('preset:') for action in actions):
+            key = next(action.split(':', 1)[1] for action in reversed(actions)
+                       if isinstance(action, str) and action.startswith('preset:'))
+            self.__select_camera_preset(key)
         elif 'resume' in actions and self.__stop_held and self.__ui.can_resume:
             self.__resume_requested = True
+
+    def __select_camera_preset(self, key):
+        ui = self.__ui
+        if key not in PRESETS or ui.preset_pending:
+            return
+        self.__neutral_required = True
+        # Preset changes pause driving, but only the driver's Stop action latches
+        # the explicit Resume requirement. Preserve an existing manual stop.
+        self.__analogue.stop()
+        self.__dashboard_status('Changing camera', 'Waiting for fresh video. Release driving controls.', 'warning')
+        try:
+            self.__car.stop()
+        except OSError:
+            ui.preset_error = True
+            ui.preset_message = 'Preset not applied: Stop was not confirmed. Try again after the link recovers.'
+            return
+        if self.__camera_settings is None:
+            ui.preset_message = 'Camera settings are unavailable in dry-run mode; use the offline preview.'
+            return
+        if self.__camera_settings.start(key):
+            ui.preset = None
+            ui.preset_error = False
+            ui.preset_pending = True
+            ui.preset_message = 'Applying '+PRESETS[key].name+'; release driving controls while the camera changes.'
+
+    def __poll_camera_settings(self):
+        settings = getattr(self, "_GameEngine__camera_settings", None)
+        if settings is None:
+            return
+        result = settings.poll()
+        if result:
+            key, error = result
+            if error:
+                self.__ui.preset_pending = False
+                self.__ui.preset_error = True
+                self.__ui.preset_message = 'Preset failed (settings may be partial). Select a preset to retry.'
+                print('Camera preset failed: '+error, flush=True)
+                self.__preset_wait = None
+            else:
+                now = time.monotonic()
+                self.__preset_wait = (key, now, now+8)
+                self.__ui.preset_message = 'Settings accepted; waiting for a fresh '+PRESETS[key].name+' frame.'
+        wait = getattr(self, "_GameEngine__preset_wait", None)
+        if wait and time.monotonic() > wait[2]:
+            self.__ui.preset_pending = False
+            self.__ui.preset_error = True
+            self.__ui.preset_message = 'No matching video frame. Try Drive or Fast (Max detail may exceed the frame-size limit).'
+            self.__preset_wait = None
+
+    def __confirm_camera_frame(self, frame):
+        wait = getattr(self, "_GameEngine__preset_wait", None)
+        if not wait:
+            return
+        key, applied, _ = wait
+        # Drop at least the first buffered frame after setting readback. Match the
+        # decoded dimensions, not just the HTTP acknowledgement or requested enum.
+        fresh = (frame is not self.__last_raw_frame and time.monotonic()-applied >= .25)
+        if self.__video is not None:
+            _, age = self.__video.latest()
+            fresh = fresh and time.monotonic()-age > applied+.2
+        if fresh and (frame.shape[1], frame.shape[0]) == PRESETS[key].size:
+            self.__ui.preset = key
+            self.__ui.preset_pending = False
+            self.__ui.preset_message = PRESETS[key].name+' active. Release driving controls to continue; manual Stop, if set, still needs Resume.'
+            self.__preset_wait = None
+            self.__fps_sample = (time.monotonic(), self.__video.frames if self.__video else self.__http_frames)
+            self.__ui.fps = None
 
     def __update_video_rate(self, count):
         now = time.monotonic()
@@ -517,31 +781,52 @@ class GameEngine:
             if self.__car.vision_tracking_is_on:
                 self.__car.toggle_vision_tracking()
         elif user_choice == 4:
+            try:
+                self.__car.toggle_vision_tracking()
+            except RuntimeError as exc:
+                print(exc)
+                return
             self.__autonomous_mode = False
             self.__run_person_follower = False
-            self.__car.toggle_vision_tracking()
         elif user_choice == 5:
-            self.__autonomous_mode = not self.__autonomous_mode
-            self.__run_person_follower = not self.__run_person_follower
+            enabled = not self.__run_person_follower
             toggle_vision_tracking = (
                 not self.__car.vision_tracking_is_on
-                and self.__run_person_follower
+                and enabled
             ) or (
-                not self.__run_person_follower
+                not enabled
                 and self.__car.vision_tracking_is_on
             )
             if toggle_vision_tracking:
-                self.__car.toggle_vision_tracking()
+                try:
+                    self.__car.toggle_vision_tracking()
+                except RuntimeError as exc:
+                    print(exc)
+                    return
+            if enabled:
+                from .person_follower import PersonFollower
+                self.__person_follower = PersonFollower(self.__car, self.__capture_shape)
+            self.__autonomous_mode = enabled
+            self.__run_person_follower = enabled
         else:
             self.__autonomous_mode = True
             self.__car.set_mode(user_choice)
 
     def release_resources(self):
+        if getattr(self, "_GameEngine__connection", None) is not None:
+            self.__connection.close()
+            self.__camera_settings.close()
+            for pad in self.__joysticks.values():
+                pad.quit()
+            return
         try:
             with suppress(OSError):
                 self.__car.stop()
         finally:
             self.__car.disconnect()
+            settings = getattr(self, "_GameEngine__camera_settings", None)
+            if settings is not None:
+                settings.close()
             for pad in getattr(self, "_GameEngine__joysticks", {}).values():
                 pad.quit()
             video = getattr(self, "_GameEngine__video", None)
@@ -549,7 +834,11 @@ class GameEngine:
                 video.close()
 
 
-def main() -> None:
+def legacy_main() -> None:
+    main(legacy=True)
+
+
+def main(legacy: bool = False) -> None:
     parser = argparse.ArgumentParser(
         description="Program for remotely controlling Elegoo Smart "
         "Robot Car v4.0"
@@ -582,15 +871,17 @@ def main() -> None:
         action="store_true",
         help="Print the version and exit.",
     )
-    parser.add_argument("--video", choices=("udp", "http"), default="http",
-                        help="Video transport (default: http; udp requires local UDP camera firmware).")
-    parser.add_argument("--analogue-drive", action="store_true",
-                        help="Trigger throttle + proportional steering/pan; requires new paired firmware.")
+    parser.add_argument("--video", choices=("udp", "http"), default=None,
+                        help="Video transport (default: udp for dashboard, http for legacy).")
+    parser.add_argument("--analogue-drive", action="store_true", default=not legacy,
+                        help="Use the analogue dashboard (already the default for elegoo-smartcar-control).")
     parser.add_argument("--trace-camera", action="store_true",
                         help="Log acknowledged analogue camera targets on change and once per second.")
     parser.add_argument("--dashboard-preview", action="store_true",
                         help="Open the offline dashboard preview without connecting to a robot.")
     args = parser.parse_args()
+    if args.video is None:
+        args.video = "udp" if args.analogue_drive else "http"
 
     if args.version_requested:
         print(f"Version: {__version__}")

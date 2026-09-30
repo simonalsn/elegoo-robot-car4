@@ -25,6 +25,10 @@ class FrameAssembler:
         self.total = 0
         self.count = 0
         self.finished = False
+        self.incomplete_frames = 0
+        self.expired_frames = 0
+        self.completed_frames = 0
+        self.last_frame_bytes = 0
 
     def feed(self, packet, now):
         if len(packet) < HEADER.size:
@@ -37,12 +41,15 @@ class FrameAssembler:
         if len(payload) != min(CHUNK, total - index * CHUNK):
             return None
         if self.sequence is None or 0 < ((sequence - self.sequence) & 0xffffffff) < 0x80000000:
+            if self.sequence is not None and not self.finished:
+                self.incomplete_frames += 1
             self.sequence, self.total, self.count = sequence, total, count
             self.started, self.finished, self.parts = now, False, {}
         if (sequence != self.sequence or self.finished or total != self.total
                 or count != self.count):
             return None
         if now - self.started > 0.25:
+            self.expired_frames += 1
             self.parts.clear()
             self.finished = True
             return None
@@ -53,6 +60,8 @@ class FrameAssembler:
         self.parts.clear()
         self.finished = True
         if jpeg.startswith(b'\xff\xd8') and jpeg.endswith(b'\xff\xd9'):
+            self.completed_frames += 1
+            self.last_frame_bytes = len(jpeg)
             return jpeg
         return None
 
@@ -60,7 +69,10 @@ class FrameAssembler:
 class UdpVideo:
     def __init__(self, host, port=5000):
         self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 262144)
+        # Extra datagram headroom for large JPEG bursts; frame cap, deadline and
+        # latest-frame-only decoding remain unchanged. The OS may clamp this.
+        self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024*1024)
+        self.receive_buffer_bytes = self._socket.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
         self._socket.settimeout(0.05)
         self._socket.connect((host, port))  # filters packets and replies through same firewall tuple
         self._token = secrets.randbits(32)
@@ -113,6 +125,13 @@ class UdpVideo:
                 return None, float('inf')
             frame, received = self._latest
             return frame, time.monotonic() - received
+
+    def diagnostics(self):
+        """Approximate counters for troubleshooting, never a connection verdict."""
+        a = self._assembler
+        return dict(completed=a.completed_frames, incomplete=a.incomplete_frames,
+                    expired=a.expired_frames, last_jpeg_bytes=a.last_frame_bytes,
+                    receive_buffer_bytes=self.receive_buffer_bytes)
 
     def close(self):
         self._stop.set()
